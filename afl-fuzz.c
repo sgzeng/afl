@@ -31,7 +31,7 @@
 #include "debug.h"
 #include "alloc-inl.h"
 #include "hash.h"
-
+#include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -4579,23 +4579,29 @@ abort_trimming:
 
 }
 
-EXP_ST void depress_mutation(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u32 buf_len){
-  // check if bl_set is valid against out_buf
-  for(u32 i=0; i<bl_len; i++){
-    if(bl_set[i] >= buf_len) goto abandon_entry;
-    // xor only the bit in bl_set between in_buf and out_buf
-    u32 position = bl_set[i] >> 3;
-    if(in_buf[position] ^ out_buf[position]){
-      // restore to the original
-      out_buf[bl_set[i]] = in_buf[bl_set[i]];
-    }
-  }
-}
+//EXP_ST void depress_mutation(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u32 buf_len){
+//  // check if bl_set is valid against out_buf
+//  for(u32 i=0; i<bl_len; i++){
+//    if(bl_set[i] >= buf_len){
+//      // handle error
+//      return;
+//    }
+//    // xor only the bit in bl_set between in_buf and out_buf
+//    u32 position = bl_set[i] >> 3;
+//    if(in_buf[position] ^ out_buf[position]){
+//      // restore to the original
+//      out_buf[bl_set[i]] = in_buf[bl_set[i]];
+//    }
+//  }
+//}
 
 EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u32 buf_len){
   // check if bl_set is valid against out_buf
   for(u32 i=0; i<bl_len; i++){
-    if(bl_set[i] >= buf_len) goto abandon_entry;
+    if(bl_set[i] >= buf_len){
+      // handle error
+      return true;
+    }
     // xor only the bit in bl_set between in_buf and out_buf
     u32 position = bl_set[i] >> 3;
     if(in_buf[position] ^ out_buf[position]){
