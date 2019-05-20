@@ -25,7 +25,9 @@
 
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
+#define MAXSOCKECTPKG 2048
 
+#include "map.h"
 #include "config.h"
 #include "types.h"
 #include "debug.h"
@@ -55,6 +57,9 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <arpa/inet.h>
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -132,8 +137,10 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
 
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
+           socketsrv_pid = -1,        /* PID of the fork socket server           */
            out_dir_fd = -1;           /* FD of the lock file              */
 
+map_t(u32) coverage_distribution_map;
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
 EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
@@ -4618,6 +4625,7 @@ EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u3
 EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   u8 fault;
+  u32 checksum;
 
   if (post_handler) {
 
@@ -4629,6 +4637,14 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   write_to_testcase(out_buf, len);
 
   fault = run_target(argv, exec_tmout);
+//  checksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+//  if(!map_get(&coverage_distribution_map, checksum)){
+//    map_set(&coverage_distribution_map, checksum, 1);
+//  }else {
+//    int count = map_get(&coverage_distribution_map, checksum);
+//    assert(count > 0);
+//    map_set(&coverage_distribution_map, checksum, count+1);
+//  }
 
   if (stop_soon) return 1;
 
@@ -4964,11 +4980,9 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 }
 
 
-/* Take the current entry from the queue, fuzz it for a while. This
-   function is a tad too long... returns 0 if fuzzed successfully, 1 if
-   skipped or bailed out. */
+/* Determinisitc sampling, return the computed entropy*/
 
-static u8 fuzz_one(char** argv) {
+static u8 computeEntropy(char** argv) {
 
   // a set of blacklist offset
   // avoid mutating those bytes during fuzzing
@@ -4977,6 +4991,1169 @@ static u8 fuzz_one(char** argv) {
   36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, \
   55, 56, 57, 58, 59, 60, 61, 62, 63};
   u32* bl_bit_set = test_set;
+
+  s32 len, fd, temp_len, i, j;
+  u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
+  u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
+  u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
+
+  u8  ret_val = 1, doing_det = 0;
+
+  u8  a_collect[MAX_AUTO_EXTRA];
+  u32 a_len = 0;
+
+#ifdef IGNORE_FINDS
+
+  /* In IGNORE_FINDS mode, skip any entries that weren't in the
+     initial data set. */
+
+  if (queue_cur->depth > 1) return 1;
+
+#else
+
+  if (pending_favored) {
+
+    /* If we have any favored, non-fuzzed new arrivals in the queue,
+       possibly skip to them at the expense of already-fuzzed or non-favored
+       cases. */
+
+    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
+        UR(100) < SKIP_TO_NEW_PROB) return 1;
+
+  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
+
+    /* Otherwise, still possibly skip non-favored cases, albeit less often.
+       The odds of skipping stuff are higher for already-fuzzed inputs and
+       lower for never-fuzzed entries. */
+
+    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
+
+      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
+
+    } else {
+
+      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
+
+    }
+
+  }
+
+#endif /* ^IGNORE_FINDS */
+
+  if (not_on_tty) {
+    ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...",
+         current_entry, queued_paths, unique_crashes);
+    fflush(stdout);
+  }
+
+  /* Map the test case into memory. */
+
+  fd = open(queue_cur->fname, O_RDONLY);
+
+  if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
+
+  len = queue_cur->len;
+
+  orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
+  if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
+
+  close(fd);
+
+  /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
+     single byte anyway, so it wouldn't give us any performance or memory usage
+     benefits. */
+
+  out_buf = ck_alloc_nozero(len);
+
+  subseq_tmouts = 0;
+
+  cur_depth = queue_cur->depth;
+
+  map_init(&coverage_distribution_map);
+
+  /*******************************************
+   * CALIBRATION (only if failed earlier on) *
+   *******************************************/
+
+  if (queue_cur->cal_failed) {
+
+    u8 res = FAULT_TMOUT;
+
+    if (queue_cur->cal_failed < CAL_CHANCES) {
+
+      res = calibrate_case(argv, queue_cur, in_buf, queue_cycle - 1, 0);
+
+      if (res == FAULT_ERROR)
+        FATAL("Unable to execute target application");
+
+    }
+
+    if (stop_soon || res != crash_mode) {
+      cur_skipped_paths++;
+    }
+
+  }
+
+  /************
+   * TRIMMING *
+   ************/
+
+  if (!dumb_mode && !queue_cur->trim_done) {
+
+    u8 res = trim_case(argv, queue_cur, in_buf);
+
+    if (res == FAULT_ERROR)
+      FATAL("Unable to execute target application");
+
+    if (stop_soon) {
+      cur_skipped_paths++;
+    }
+
+    /* Don't retry trimming, even if it failed. */
+
+    queue_cur->trim_done = 1;
+
+    if (len != queue_cur->len) len = queue_cur->len;
+
+  }
+
+  memcpy(out_buf, in_buf, len);
+
+  /*********************
+   * PERFORMANCE SCORE *
+   *********************/
+
+  orig_perf = perf_score = calculate_score(queue_cur);
+
+  /* Skip right away if -d is given, if we have done deterministic fuzzing on
+     this entry ourselves (was_fuzzed), or if it has gone through deterministic
+     testing in earlier, resumed runs (passed_det). */
+
+//  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
+//    goto havoc_stage;
+
+  /* Skip deterministic fuzzing if exec path checksum puts this out of scope
+     for this master instance. */
+
+//  if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
+//    goto havoc_stage;
+
+  doing_det = 1;
+
+  /*********************************************
+   * SIMPLE BITFLIP (+dictionary construction) *
+   *********************************************/
+
+#define FLIP_BIT(_ar, _b) do { \
+    u8* _arf = (u8*)(_ar); \
+    u32 _bf = (_b); \
+    _arf[(_bf) >> 3] ^= (128 >> ((_bf) & 7)); \
+  } while (0)
+
+  /* Single walking bit. */
+
+  stage_short = "flip1";
+  stage_max   = len << 3;
+  stage_name  = "bitflip 1/1";
+
+  stage_val_type = STAGE_VAL_NONE;
+
+  orig_hit_cnt = queued_paths + unique_crashes;
+
+  prev_cksum = queue_cur->exec_cksum;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur >> 3;
+
+    FLIP_BIT(out_buf, stage_cur);
+
+    // check and restore bits in the offset blacklist
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+      if (common_fuzz_stuff(argv, out_buf, len)) ;
+    }
+
+    FLIP_BIT(out_buf, stage_cur);
+
+    /* While flipping the least significant bit in every byte, pull of an extra
+       trick to detect possible syntax tokens. In essence, the idea is that if
+       you have a binary blob like this:
+
+       xxxxxxxxIHDRxxxxxxxx
+
+       ...and changing the leading and trailing bytes causes variable or no
+       changes in program flow, but touching any character in the "IHDR" string
+       always produces the same, distinctive path, it's highly likely that
+       "IHDR" is an atomically-checked magic value of special significance to
+       the fuzzed format.
+
+       We do this here, rather than as a separate stage, because it's a nice
+       way to keep the operation approximately "free" (i.e., no extra execs).
+       
+       Empirically, performing the check when flipping the least significant bit
+       is advantageous, compared to doing it at the time of more disruptive
+       changes, where the program flow may be affected in more violent ways.
+
+       The caveat is that we won't generate dictionaries in the -d mode or -S
+       mode - but that's probably a fair trade-off.
+
+       This won't work particularly well with paths that exhibit variable
+       behavior, but fails gracefully, so we'll carry out the checks anyway.
+
+      */
+
+    if (!dumb_mode && (stage_cur & 7) == 7) {
+
+      u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+      if (stage_cur == stage_max - 1 && cksum == prev_cksum) {
+
+        /* If at end of file and we are still collecting a string, grab the
+           final character and force output. */
+
+        if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];
+        a_len++;
+
+        if (a_len >= MIN_AUTO_EXTRA && a_len <= MAX_AUTO_EXTRA)
+          maybe_add_auto(a_collect, a_len);
+
+      } else if (cksum != prev_cksum) {
+
+        /* Otherwise, if the checksum has changed, see if we have something
+           worthwhile queued up, and collect that if the answer is yes. */
+
+        if (a_len >= MIN_AUTO_EXTRA && a_len <= MAX_AUTO_EXTRA)
+          maybe_add_auto(a_collect, a_len);
+
+        a_len = 0;
+        prev_cksum = cksum;
+
+      }
+
+      /* Continue collecting string, but only if the bit flip actually made
+         any difference - we don't want no-op tokens. */
+
+      if (cksum != queue_cur->exec_cksum) {
+
+        if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];        
+        a_len++;
+
+      }
+
+    }
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP1]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP1] += stage_max;
+
+  /* Two walking bits. */
+
+  stage_name  = "bitflip 2/1";
+  stage_short = "flip2";
+  stage_max   = (len << 3) - 1;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur >> 3;
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+      if (common_fuzz_stuff(argv, out_buf, len)) ;
+    }
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP2]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP2] += stage_max;
+
+  /* Four walking bits. */
+
+  stage_name  = "bitflip 4/1";
+  stage_short = "flip4";
+  stage_max   = (len << 3) - 3;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur >> 3;
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+    FLIP_BIT(out_buf, stage_cur + 2);
+    FLIP_BIT(out_buf, stage_cur + 3);
+
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+      if (common_fuzz_stuff(argv, out_buf, len)) ;
+    }
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+    FLIP_BIT(out_buf, stage_cur + 2);
+    FLIP_BIT(out_buf, stage_cur + 3);
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP4]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP4] += stage_max;
+
+  /* Effector map setup. These macros calculate:
+
+     EFF_APOS      - position of a particular file offset in the map.
+     EFF_ALEN      - length of a map with a particular number of bytes.
+     EFF_SPAN_ALEN - map span for a sequence of bytes.
+
+   */
+
+#define EFF_APOS(_p)          ((_p) >> EFF_MAP_SCALE2)
+#define EFF_REM(_x)           ((_x) & ((1 << EFF_MAP_SCALE2) - 1))
+#define EFF_ALEN(_l)          (EFF_APOS(_l) + !!EFF_REM(_l))
+#define EFF_SPAN_ALEN(_p, _l) (EFF_APOS((_p) + (_l) - 1) - EFF_APOS(_p) + 1)
+
+  /* Initialize effector map for the next step (see comments below). Always
+     flag first and last byte as doing something. */
+
+  eff_map    = ck_alloc(EFF_ALEN(len));
+  eff_map[0] = 1;
+
+  if (EFF_APOS(len - 1) != 0) {
+    eff_map[EFF_APOS(len - 1)] = 1;
+    eff_cnt++;
+  }
+
+  /* Walking byte. */
+
+  stage_name  = "bitflip 8/8";
+  stage_short = "flip8";
+  stage_max   = len;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur;
+
+    out_buf[stage_cur] ^= 0xFF;
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+      if (common_fuzz_stuff(argv, out_buf, len)) ;
+    }
+
+    /* We also use this stage to pull off a simple trick: we identify
+       bytes that seem to have no effect on the current execution path
+       even when fully flipped - and we skip them during more expensive
+       deterministic stages, such as arithmetics or known ints. */
+
+    if (!eff_map[EFF_APOS(stage_cur)]) {
+
+      u32 cksum;
+
+      /* If in dumb mode or if the file is very short, just flag everything
+         without wasting time on checksums. */
+
+      if (!dumb_mode && len >= EFF_MIN_LEN)
+        cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+      else
+        cksum = ~queue_cur->exec_cksum;
+
+      if (cksum != queue_cur->exec_cksum) {
+        eff_map[EFF_APOS(stage_cur)] = 1;
+        eff_cnt++;
+      }
+
+    }
+
+    out_buf[stage_cur] ^= 0xFF;
+
+  }
+
+  /* If the effector map is more than EFF_MAX_PERC dense, just flag the
+     whole thing as worth fuzzing, since we wouldn't be saving much time
+     anyway. */
+
+  if (eff_cnt != EFF_ALEN(len) &&
+      eff_cnt * 100 / EFF_ALEN(len) > EFF_MAX_PERC) {
+
+    memset(eff_map, 1, EFF_ALEN(len));
+
+    blocks_eff_select += EFF_ALEN(len);
+
+  } else {
+
+    blocks_eff_select += eff_cnt;
+
+  }
+
+  blocks_eff_total += EFF_ALEN(len);
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP8]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP8] += stage_max;
+
+  /* Two walking bytes. */
+
+  if (len < 2) goto skip_bitflip;
+
+  stage_name  = "bitflip 16/8";
+  stage_short = "flip16";
+  stage_cur   = 0;
+  stage_max   = len - 1;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len - 1; i++) {
+
+    /* Let's consult the effector map... */
+
+    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
+      stage_max--;
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    *(u16*)(out_buf + i) ^= 0xFFFF;
+
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+      if (common_fuzz_stuff(argv, out_buf, len)) ;
+    }
+    stage_cur++;
+
+    *(u16*)(out_buf + i) ^= 0xFFFF;
+
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP16]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP16] += stage_max;
+
+  if (len < 4) goto skip_bitflip;
+
+  /* Four walking bytes. */
+
+  stage_name  = "bitflip 32/8";
+  stage_short = "flip32";
+  stage_cur   = 0;
+  stage_max   = len - 3;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len - 3; i++) {
+
+    /* Let's consult the effector map... */
+    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)] &&
+        !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
+      stage_max--;
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
+
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+      if (common_fuzz_stuff(argv, out_buf, len)) ;
+    }
+    stage_cur++;
+
+    *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP32]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP32] += stage_max;
+
+skip_bitflip:
+
+  if (no_arith) goto skip_arith;
+
+  /**********************
+   * ARITHMETIC INC/DEC *
+   **********************/
+
+  /* 8-bit arithmetics. */
+
+  stage_name  = "arith 8/8";
+  stage_short = "arith8";
+  stage_cur   = 0;
+  stage_max   = 2 * len * ARITH_MAX;
+
+  stage_val_type = STAGE_VAL_LE;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len; i++) {
+
+    u8 orig = out_buf[i];
+
+    /* Let's consult the effector map... */
+
+    if (!eff_map[EFF_APOS(i)]) {
+      stage_max -= 2 * ARITH_MAX;
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    for (j = 1; j <= ARITH_MAX; j++) {
+
+      u8 r = orig ^ (orig + j);
+
+      /* Do arithmetic operations only if the result couldn't be a product
+         of a bitflip. */
+
+      if (!could_be_bitflip(r)) {
+
+        stage_cur_val = j;
+        out_buf[i] = orig + j;
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      r =  orig ^ (orig - j);
+
+      if (!could_be_bitflip(r)) {
+
+        stage_cur_val = -j;
+        out_buf[i] = orig - j;
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      out_buf[i] = orig;
+
+    }
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_ARITH8]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_ARITH8] += stage_max;
+
+  /* 16-bit arithmetics, both endians. */
+
+  if (len < 2) goto skip_arith;
+
+  stage_name  = "arith 16/8";
+  stage_short = "arith16";
+  stage_cur   = 0;
+  stage_max   = 4 * (len - 1) * ARITH_MAX;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len - 1; i++) {
+
+    u16 orig = *(u16*)(out_buf + i);
+
+    /* Let's consult the effector map... */
+
+    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
+      stage_max -= 4 * ARITH_MAX;
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    for (j = 1; j <= ARITH_MAX; j++) {
+
+      u16 r1 = orig ^ (orig + j),
+          r2 = orig ^ (orig - j),
+          r3 = orig ^ SWAP16(SWAP16(orig) + j),
+          r4 = orig ^ SWAP16(SWAP16(orig) - j);
+
+      /* Try little endian addition and subtraction first. Do it only
+         if the operation would affect more than one byte (hence the 
+         & 0xff overflow checks) and if it couldn't be a product of
+         a bitflip. */
+
+      stage_val_type = STAGE_VAL_LE; 
+
+      if ((orig & 0xff) + j > 0xff && !could_be_bitflip(r1)) {
+
+        stage_cur_val = j;
+        *(u16*)(out_buf + i) = orig + j;
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+ 
+      } else stage_max--;
+
+      if ((orig & 0xff) < j && !could_be_bitflip(r2)) {
+
+        stage_cur_val = -j;
+        *(u16*)(out_buf + i) = orig - j;
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      /* Big endian comes next. Same deal. */
+
+      stage_val_type = STAGE_VAL_BE;
+
+
+      if ((orig >> 8) + j > 0xff && !could_be_bitflip(r3)) {
+
+        stage_cur_val = j;
+        *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) + j);
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      if ((orig >> 8) < j && !could_be_bitflip(r4)) {
+
+        stage_cur_val = -j;
+        *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) - j);
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      *(u16*)(out_buf + i) = orig;
+
+    }
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_ARITH16]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_ARITH16] += stage_max;
+
+  /* 32-bit arithmetics, both endians. */
+
+  if (len < 4) goto skip_arith;
+
+  stage_name  = "arith 32/8";
+  stage_short = "arith32";
+  stage_cur   = 0;
+  stage_max   = 4 * (len - 3) * ARITH_MAX;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len - 3; i++) {
+
+    u32 orig = *(u32*)(out_buf + i);
+
+    /* Let's consult the effector map... */
+
+    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)] &&
+        !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
+      stage_max -= 4 * ARITH_MAX;
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    for (j = 1; j <= ARITH_MAX; j++) {
+
+      u32 r1 = orig ^ (orig + j),
+          r2 = orig ^ (orig - j),
+          r3 = orig ^ SWAP32(SWAP32(orig) + j),
+          r4 = orig ^ SWAP32(SWAP32(orig) - j);
+
+      /* Little endian first. Same deal as with 16-bit: we only want to
+         try if the operation would have effect on more than two bytes. */
+
+      stage_val_type = STAGE_VAL_LE;
+
+      if ((orig & 0xffff) + j > 0xffff && !could_be_bitflip(r1)) {
+
+        stage_cur_val = j;
+        *(u32*)(out_buf + i) = orig + j;
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      if ((orig & 0xffff) < j && !could_be_bitflip(r2)) {
+
+        stage_cur_val = -j;
+        *(u32*)(out_buf + i) = orig - j;
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      /* Big endian next. */
+
+      stage_val_type = STAGE_VAL_BE;
+
+      if ((SWAP32(orig) & 0xffff) + j > 0xffff && !could_be_bitflip(r3)) {
+
+        stage_cur_val = j;
+        *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) + j);
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      if ((SWAP32(orig) & 0xffff) < j && !could_be_bitflip(r4)) {
+
+        stage_cur_val = -j;
+        *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) - j);
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      *(u32*)(out_buf + i) = orig;
+
+    }
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_ARITH32]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_ARITH32] += stage_max;
+
+skip_arith:
+
+  /**********************
+   * INTERESTING VALUES *
+   **********************/
+
+  stage_name  = "interest 8/8";
+  stage_short = "int8";
+  stage_cur   = 0;
+  stage_max   = len * sizeof(interesting_8);
+
+  stage_val_type = STAGE_VAL_LE;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  /* Setting 8-bit integers. */
+
+  for (i = 0; i < len; i++) {
+
+    u8 orig = out_buf[i];
+
+    /* Let's consult the effector map... */
+
+    if (!eff_map[EFF_APOS(i)]) {
+      stage_max -= sizeof(interesting_8);
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    for (j = 0; j < sizeof(interesting_8); j++) {
+
+      /* Skip if the value could be a product of bitflips or arithmetics. */
+
+      if (could_be_bitflip(orig ^ (u8)interesting_8[j]) ||
+          could_be_arith(orig, (u8)interesting_8[j], 1)) {
+        stage_max--;
+        continue;
+      }
+
+      stage_cur_val = interesting_8[j];
+      out_buf[i] = interesting_8[j];
+
+      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+
+      out_buf[i] = orig;
+      stage_cur++;
+
+    }
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_INTEREST8]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_INTEREST8] += stage_max;
+
+  /* Setting 16-bit integers, both endians. */
+
+//  if (no_arith || len < 2) goto skip_interest;
+
+  stage_name  = "interest 16/8";
+  stage_short = "int16";
+  stage_cur   = 0;
+  stage_max   = 2 * (len - 1) * (sizeof(interesting_16) >> 1);
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len - 1; i++) {
+
+    u16 orig = *(u16*)(out_buf + i);
+
+    /* Let's consult the effector map... */
+
+    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
+      stage_max -= sizeof(interesting_16);
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    for (j = 0; j < sizeof(interesting_16) / 2; j++) {
+
+      stage_cur_val = interesting_16[j];
+
+      /* Skip if this could be a product of a bitflip, arithmetics,
+         or single-byte interesting value insertion. */
+
+      if (!could_be_bitflip(orig ^ (u16)interesting_16[j]) &&
+          !could_be_arith(orig, (u16)interesting_16[j], 2) &&
+          !could_be_interest(orig, (u16)interesting_16[j], 2, 0)) {
+
+        stage_val_type = STAGE_VAL_LE;
+
+        *(u16*)(out_buf + i) = interesting_16[j];
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      if ((u16)interesting_16[j] != SWAP16(interesting_16[j]) &&
+          !could_be_bitflip(orig ^ SWAP16(interesting_16[j])) &&
+          !could_be_arith(orig, SWAP16(interesting_16[j]), 2) &&
+          !could_be_interest(orig, SWAP16(interesting_16[j]), 2, 1)) {
+
+        stage_val_type = STAGE_VAL_BE;
+
+        *(u16*)(out_buf + i) = SWAP16(interesting_16[j]);
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+    }
+
+    *(u16*)(out_buf + i) = orig;
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_INTEREST16]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_INTEREST16] += stage_max;
+
+//  if (len < 4) goto skip_interest;
+
+  /* Setting 32-bit integers, both endians. */
+
+  stage_name  = "interest 32/8";
+  stage_short = "int32";
+  stage_cur   = 0;
+  stage_max   = 2 * (len - 3) * (sizeof(interesting_32) >> 2);
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len - 3; i++) {
+
+    u32 orig = *(u32*)(out_buf + i);
+
+    /* Let's consult the effector map... */
+
+    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)] &&
+        !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
+      stage_max -= sizeof(interesting_32) >> 1;
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    for (j = 0; j < sizeof(interesting_32) / 4; j++) {
+
+      stage_cur_val = interesting_32[j];
+
+      /* Skip if this could be a product of a bitflip, arithmetics,
+         or word interesting value insertion. */
+
+      if (!could_be_bitflip(orig ^ (u32)interesting_32[j]) &&
+          !could_be_arith(orig, interesting_32[j], 4) &&
+          !could_be_interest(orig, interesting_32[j], 4, 0)) {
+
+        stage_val_type = STAGE_VAL_LE;
+
+        *(u32*)(out_buf + i) = interesting_32[j];
+
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+      if ((u32)interesting_32[j] != SWAP32(interesting_32[j]) &&
+          !could_be_bitflip(orig ^ SWAP32(interesting_32[j])) &&
+          !could_be_arith(orig, SWAP32(interesting_32[j]), 4) &&
+          !could_be_interest(orig, SWAP32(interesting_32[j]), 4, 1)) {
+
+        stage_val_type = STAGE_VAL_BE;
+
+        *(u32*)(out_buf + i) = SWAP32(interesting_32[j]);
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+          if (common_fuzz_stuff(argv, out_buf, len)) ;
+        }
+        stage_cur++;
+
+      } else stage_max--;
+
+    }
+
+    *(u32*)(out_buf + i) = orig;
+
+  }
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_INTEREST32]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_INTEREST32] += stage_max;
+
+//skip_interest:
+
+  splicing_with = -1;
+
+  /* Update pending_not_fuzzed count if we made it through the calibration
+     cycle and have not seen this entry before. */
+
+  if (!stop_soon && !queue_cur->cal_failed && !queue_cur->was_fuzzed) {
+    queue_cur->was_fuzzed = 1;
+    pending_not_fuzzed--;
+    if (queue_cur->favored) pending_favored--;
+  }
+
+  munmap(orig_in, queue_cur->len);
+
+  if (in_buf != orig_in) ck_free(in_buf);
+  ck_free(out_buf);
+  ck_free(eff_map);
+
+//    u32 key;
+//    map_iter_t iter;
+//    iter = map_iter(coverage_distribution_map);
+//    // compute the size of map, need to changed
+//    int size = 0;
+//    while ((key = map_next(&coverage_distribution_map, &iter))) {
+//        size++;
+//    }
+//    iter = map_iter(coverage_distribution_map);
+//    double entropy = 0;
+//    double probability=0;
+//    while ((key = map_next(&coverage_distribution_map, &iter))) {
+//        int count = map_get(&coverage_distribution_map, key);
+//        probability = count / size;
+//        entropy += - (probability * log2n(probability));
+//    }
+
+  map_deinit(&coverage_distribution_map);
+  return ret_val;
+
+#undef FLIP_BIT
+
+}
+
+void readNext(void* buffer, size_t bufferlen, char** data, size_t datalen)
+{
+  if(datalen > bufferlen){
+    return;
+  }
+  memcpy(buffer, *data, datalen);
+  *data = *data + datalen;
+}
+
+void printBuffer(void * buffer, size_t len)
+{
+  for(int i=0; i<len; i++){
+    printf("%x", *(char *)(buffer+i));
+  }
+  printf("\n");
+}
+
+int readmsg(int sock, char* input, int* inputlen, int* offset, int* offsetSize)
+{
+  int length = 0;
+  char opcode;
+  if(!read(sock, &length, 4)){
+    perror("connection reset by the client");
+    return -1;
+  }
+  if (length > MAXSOCKECTPKG || length <= 9) {
+    printf("length<0x%x> is invalid \n", length);
+    return 0;
+  }
+  char data[length];
+  char* buffer = data;
+  if(!read(sock, buffer, length)){
+    perror("connection reset by the client");
+    return -1;
+  }
+  // for debug
+  // printBuffer(buffer, length);
+  readNext(&opcode, 1, &buffer, 1);
+  if (opcode == 0x02){
+    // read input length
+    readNext(inputlen, 4, &buffer, 4);
+    // read input
+    if (*inputlen + 9 >= length) {
+      printf("length<0x%x> and inputlen<0x%x> are invalid \n", length, *inputlen);
+      return 0;
+    }
+    readNext(input, MAXSOCKECTPKG, &buffer, *inputlen);
+    // read blocked offset length
+    readNext(offsetSize, 4, &buffer, 4);
+    if (*inputlen + *offsetSize * sizeof(int) + 9 != length){
+      printf("length<0x%x>, inputlen<0x%x> and offsetSize<0x%x> are invalid \n", length, *inputlen, *offsetSize);
+      return 0;
+    }
+    // read blocked offset
+    readNext(&offset, MAXSOCKECTPKG * sizeof(int), &buffer, *offsetSize);
+    return 1;
+  }
+  printf("opcode<0x%x> is invalid \n", opcode);
+  return 0;
+}
+
+void appendBuffer(void* dst, void* src, int size, int* index)
+{
+  int current = *index;
+  memcpy(dst + current, src, size);
+  *index = current + size;
+}
+
+int makeReplyMsg(double entropy, char* clnt_buf)
+{
+  char opcode = 0x01;
+  int length = sizeof(opcode) + sizeof(double);
+  int index = 0;
+  appendBuffer(clnt_buf, &length, sizeof(length), &index);
+  appendBuffer(clnt_buf, &opcode, sizeof(opcode), &index);
+  appendBuffer(clnt_buf, &entropy, sizeof(double), &index);
+  return length + sizeof(int);
+}
+
+void startSocketSrv(char** argv) {
+  socklen_t clnt_len;
+  int orig_sock, new_sock;
+  int* blocked_offset;
+  char* input;
+  static struct sockaddr_in clnt_adr, serv_adr;
+  const int PORT = 7777;
+
+  //start_socket();
+  if ((orig_sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
+    perror("generate error");
+  }
+
+  //start_bind();
+  memset(&serv_adr, 0, sizeof(serv_adr));
+  serv_adr.sin_family = AF_INET;
+  serv_adr.sin_addr.s_addr = htonl(INADDR_ANY);
+  serv_adr.sin_port = htons(PORT);
+
+  if (bind(orig_sock, (struct sockaddr *)&serv_adr,
+           sizeof(serv_adr)) < 0) {
+    perror("bind error");
+    close(orig_sock);
+  }
+
+  //start_listen();
+  listen(orig_sock, 5);
+
+  //start_accept();
+  clnt_len = sizeof(clnt_adr);
+  if ((new_sock = accept(orig_sock, (struct sockaddr *)&clnt_adr, &clnt_len)) < 0) {
+    perror("accept error");
+    close(orig_sock);
+  }
+
+  while(1) {
+    input = malloc(MAXSOCKECTPKG);
+    blocked_offset = malloc(MAXSOCKECTPKG * sizeof(int));
+    int inputlen = 0;
+    int offsetSize = 0;
+    int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offsetSize);
+    if(status == -1) break;
+    if (!status) {
+      perror("Client ask me to abort");
+      free(input);
+      free(blocked_offset);
+      printf("Waiting for another request\n");
+      continue;
+    }
+    double entropy = 0;
+//    double entropy = computeEntropy(argv);
+    char clnt_buf[MAXSOCKECTPKG];
+    int len = makeReplyMsg(entropy, clnt_buf);
+    if(write(new_sock, clnt_buf, len) < 0) {
+      PFATAL("write to socket failed");
+    }
+    free(input);
+    free(blocked_offset);
+    printf("Waiting for another request\n");
+  }
+  close(new_sock);
+  close(orig_sock);
+}
+/* Take the current entry from the queue, fuzz it for a while. This
+   function is a tad too long... returns 0 if fuzzed successfully, 1 if
+   skipped or bailed out. */
+
+static u8 fuzz_one(char** argv) {
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
@@ -5155,10 +6332,7 @@ static u8 fuzz_one(char** argv) {
 
     FLIP_BIT(out_buf, stage_cur);
 
-    // check and restore bits in the offset blacklist
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-    }
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
     FLIP_BIT(out_buf, stage_cur);
 
@@ -5251,9 +6425,7 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-    }
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
@@ -5282,9 +6454,7 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur + 2);
     FLIP_BIT(out_buf, stage_cur + 3);
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-    }
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
@@ -5335,9 +6505,8 @@ static u8 fuzz_one(char** argv) {
     stage_cur_byte = stage_cur;
 
     out_buf[stage_cur] ^= 0xFF;
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-    }
+
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
     /* We also use this stage to pull off a simple trick: we identify
        bytes that seem to have no effect on the current execution path
@@ -5415,9 +6584,7 @@ static u8 fuzz_one(char** argv) {
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-    }
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     stage_cur++;
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
@@ -5454,9 +6621,7 @@ static u8 fuzz_one(char** argv) {
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-    }
+    if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     stage_cur++;
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
@@ -5512,9 +6677,7 @@ skip_bitflip:
         stage_cur_val = j;
         out_buf[i] = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5526,9 +6689,7 @@ skip_bitflip:
         stage_cur_val = -j;
         out_buf[i] = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5587,9 +6748,7 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
  
       } else stage_max--;
@@ -5599,9 +6758,7 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5616,9 +6773,7 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) + j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5628,9 +6783,7 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) - j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5688,9 +6841,7 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5700,9 +6851,7 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5716,9 +6865,7 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) + j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5728,9 +6875,7 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) - j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5789,9 +6934,7 @@ skip_arith:
       stage_cur_val = interesting_8[j];
       out_buf[i] = interesting_8[j];
 
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       out_buf[i] = orig;
       stage_cur++;
@@ -5844,9 +6987,7 @@ skip_arith:
 
         *(u16*)(out_buf + i) = interesting_16[j];
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5859,9 +7000,7 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u16*)(out_buf + i) = SWAP16(interesting_16[j]);
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5917,9 +7056,7 @@ skip_arith:
 
         *(u32*)(out_buf + i) = interesting_32[j];
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -5932,9 +7069,7 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u32*)(out_buf + i) = SWAP32(interesting_32[j]);
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
       } else stage_max--;
@@ -6000,9 +7135,7 @@ skip_interest:
       last_len = extras[j].len;
       memcpy(out_buf + i, extras[j].data, last_len);
 
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       stage_cur++;
 
@@ -6046,11 +7179,9 @@ skip_interest:
       /* Copy tail */
       memcpy(ex_tmp + i + extras[j].len, out_buf + i, len - i);
 
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-        if (common_fuzz_stuff(argv, ex_tmp, len + extras[j].len)) {
-          ck_free(ex_tmp);
-          goto abandon_entry;
-        }
+      if (common_fuzz_stuff(argv, ex_tmp, len + extras[j].len)) {
+        ck_free(ex_tmp);
+        goto abandon_entry;
       }
 
       stage_cur++;
@@ -6104,9 +7235,7 @@ skip_user_extras:
       last_len = a_extras[j].len;
       memcpy(out_buf + i, a_extras[j].data, last_len);
 
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
+      if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       stage_cur++;
 
@@ -6552,10 +7681,8 @@ havoc_stage:
 
     }
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-      if (common_fuzz_stuff(argv, out_buf, temp_len))
-        goto abandon_entry;
-    }
+    if (common_fuzz_stuff(argv, out_buf, temp_len))
+      goto abandon_entry;
 
     /* out_buf might have been mangled a bit, so let's restore it to its
        original size and shape. */
@@ -6708,7 +7835,6 @@ abandon_entry:
 #undef FLIP_BIT
 
 }
-
 
 /* Grab interesting test cases from other fuzzers. */
 
@@ -8129,8 +9255,16 @@ int main(int argc, char** argv) {
         sync_fuzzers(use_argv);
 
     }
+    socketsrv_pid = fork();
+    if (socketsrv_pid < 0){
+        PFATAL("fork() failed");
+    }
+    if (!socketsrv_pid){
+        // start the sockect server
+        startSocketSrv(use_argv);
+    }
 
-    skipped_fuzz = fuzz_one(use_argv);
+      skipped_fuzz = fuzz_one(use_argv);
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
       

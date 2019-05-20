@@ -1,3 +1,4 @@
+/afl_out
 # Built objects and libraries
 *.o
 *.so
