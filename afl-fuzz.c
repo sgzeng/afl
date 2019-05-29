@@ -141,6 +141,8 @@ static s32 forksrv_pid,               /* PID of the fork server           */
            out_dir_fd = -1;           /* FD of the lock file              */
 
 map_t(u32) coverage_distribution_map;
+EXP_ST u8 slave_mode = 0;
+
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
 EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
@@ -8995,8 +8997,8 @@ int main(int argc, char** argv) {
 
         break;
 
-      case 'S': 
-
+      case 'S':
+        slave_mode = 1;
         if (sync_id) FATAL("Multiple -S or -M options not supported");
         sync_id = ck_strdup(optarg);
         break;
@@ -9228,15 +9230,16 @@ int main(int argc, char** argv) {
     start_time += 4000;
     if (stop_soon) goto stop_fuzzing;
   }
-
-  socketsrv_pid = fork();
-  if (socketsrv_pid < 0){
-    PFATAL("fork() failed");
-  }
-  if (!socketsrv_pid){
-    // start the sockect server
-    if (startSocketSrv(use_argv) < 0 ) {
-      PFATAL("start socket server failed");
+  if(slave_mode){
+    socketsrv_pid = fork();
+    if (socketsrv_pid < 0){
+      PFATAL("fork() failed");
+    }
+    if (!socketsrv_pid){
+      // start the sockect server
+      if (startSocketSrv(use_argv) < 0 ) {
+        PFATAL("start socket server failed");
+      }
     }
   }
 
