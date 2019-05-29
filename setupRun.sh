@@ -7,6 +7,7 @@ OPTION=$1
 AFL_PATH=$(pwd)
 
 cd $AFL_PATH
+rm -rf ./afl_out/*
 ####################################################################################
 ###########################/ The general cases /####################################
 ####################################################################################
@@ -32,4 +33,3 @@ if [ "$OPTION" == "slave" ] || [ "$OPTION" == "s" ] ; then
     # run AFL slave
     $AFL_ROOT/afl-fuzz -S afl-slave -m none -i $INPUT -o $OUTPUT -- $AFL_CMDLINE
 fi
-

@@ -6007,11 +6007,8 @@ skip_arith:
 
 }
 
-void readNext(void* buffer, size_t bufferlen, char** data, size_t datalen)
+void readNext(void* buffer, char** data, size_t datalen)
 {
-  if(datalen > bufferlen){
-    return;
-  }
   memcpy(buffer, *data, datalen);
   *data = *data + datalen;
 }
@@ -6028,9 +6025,9 @@ int readmsg(int sock, char* input, int* inputlen, int* offset, int* offsetSize)
 {
   int length = 0;
   char opcode;
-  if(!read(sock, &length, 4)){
-    perror("connection reset by the client");
-    return -1;
+  if(!read(sock, &length, sizeof(int))){
+    printf("connection reset by the client \n");
+    return 0;
   }
   if (length > MAXSOCKECTPKG || length <= 9) {
     printf("length<0x%x> is invalid \n", length);
@@ -6039,29 +6036,31 @@ int readmsg(int sock, char* input, int* inputlen, int* offset, int* offsetSize)
   char data[length];
   char* buffer = data;
   if(!read(sock, buffer, length)){
-    perror("connection reset by the client");
+    printf("connection reset by the client \n");
+    return 0;
+  }
+  readNext(&opcode, &buffer, sizeof(char));
+  if (opcode == 0x00){
+    printf("client ask me to suicide \n");
     return -1;
   }
-  // for debug
-  // printBuffer(buffer, length);
-  readNext(&opcode, 1, &buffer, 1);
   if (opcode == 0x02){
     // read input length
-    readNext(inputlen, 4, &buffer, 4);
+    readNext(inputlen, &buffer, sizeof(int));
     // read input
     if (*inputlen + 9 >= length) {
       printf("length<0x%x> and inputlen<0x%x> are invalid \n", length, *inputlen);
       return 0;
     }
-    readNext(input, MAXSOCKECTPKG, &buffer, *inputlen);
+    readNext(input, &buffer, *inputlen);
     // read blocked offset length
-    readNext(offsetSize, 4, &buffer, 4);
+    readNext(offsetSize, &buffer, sizeof(int));
     if (*inputlen + *offsetSize * sizeof(int) + 9 != length){
       printf("length<0x%x>, inputlen<0x%x> and offsetSize<0x%x> are invalid \n", length, *inputlen, *offsetSize);
       return 0;
     }
     // read blocked offset
-    readNext(&offset, MAXSOCKECTPKG * sizeof(int), &buffer, *offsetSize);
+    readNext(offset, &buffer, *offsetSize * sizeof(int));
     return 1;
   }
   printf("opcode<0x%x> is invalid \n", opcode);
@@ -6078,7 +6077,7 @@ void appendBuffer(void* dst, void* src, int size, int* index)
 int makeReplyMsg(double entropy, char* clnt_buf)
 {
   char opcode = 0x01;
-  int length = sizeof(opcode) + sizeof(double);
+  int length = sizeof(opcode) + sizeof(entropy);
   int index = 0;
   appendBuffer(clnt_buf, &length, sizeof(length), &index);
   appendBuffer(clnt_buf, &opcode, sizeof(opcode), &index);
@@ -6086,7 +6085,7 @@ int makeReplyMsg(double entropy, char* clnt_buf)
   return length + sizeof(int);
 }
 
-void startSocketSrv(char** argv) {
+int startSocketSrv(char** argv) {
   socklen_t clnt_len;
   int orig_sock, new_sock;
   int* blocked_offset;
@@ -6096,7 +6095,8 @@ void startSocketSrv(char** argv) {
 
   //start_socket();
   if ((orig_sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
-    perror("generate error");
+    FATAL("generate error");
+    return -1;
   }
 
   //start_bind();
@@ -6107,52 +6107,67 @@ void startSocketSrv(char** argv) {
 
   if (bind(orig_sock, (struct sockaddr *)&serv_adr,
            sizeof(serv_adr)) < 0) {
-    perror("bind error");
-    close(orig_sock);
+    FATAL("bind error");
+    return -1;
   }
 
   //start_listen();
   listen(orig_sock, 5);
 
-  //start_accept();
-  clnt_len = sizeof(clnt_adr);
-  if ((new_sock = accept(orig_sock, (struct sockaddr *)&clnt_adr, &clnt_len)) < 0) {
-    perror("accept error");
-    close(orig_sock);
-  }
-
   while(1) {
-    input = malloc(MAXSOCKECTPKG);
-    blocked_offset = malloc(MAXSOCKECTPKG * sizeof(int));
+    //start_accept();
+    clnt_len = sizeof(clnt_adr);
+    if ((new_sock = accept(orig_sock, (struct sockaddr *)&clnt_adr, &clnt_len)) < 0) {
+      close(new_sock);
+      close(orig_sock);
+      FATAL("accept error");
+      return -1;
+    }
+    input = calloc(MAXSOCKECTPKG, sizeof(char));
+    blocked_offset = calloc(MAXSOCKECTPKG, sizeof(int));
     int inputlen = 0;
     int offsetSize = 0;
     int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offsetSize);
-    if(status == -1) break;
-    if (!status) {
-      perror("Client ask me to abort");
+    if (status < 0) {
       free(input);
       free(blocked_offset);
-      printf("Waiting for another request\n");
+      close(new_sock);
+      close(orig_sock);
+      exit(0);
+    }
+    if (status == 0) {
+      free(input);
+      free(blocked_offset);
+      close(new_sock);
+      printf("Client abort, waiting for another request\n");
       continue;
     }
     double entropy = 0;
+    // for debug
+//    printf("\n");
+//    printBuffer(input, inputlen);
+//    for (int i=0;i<offsetSize;i++){
+//      printf("%d ", blocked_offset[i]);
+//    }
+//    printf("\n");
+
 //    double entropy = computeEntropy(argv);
     char clnt_buf[MAXSOCKECTPKG];
     int len = makeReplyMsg(entropy, clnt_buf);
     if(write(new_sock, clnt_buf, len) < 0) {
-      PFATAL("write to socket failed");
+      FATAL("write to socket failed");
     }
     free(input);
     free(blocked_offset);
+    close(new_sock);
     printf("Waiting for another request\n");
   }
-  close(new_sock);
-  close(orig_sock);
 }
+
+
 /* Take the current entry from the queue, fuzz it for a while. This
    function is a tad too long... returns 0 if fuzzed successfully, 1 if
    skipped or bailed out. */
-
 static u8 fuzz_one(char** argv) {
 
   s32 len, fd, temp_len, i, j;
@@ -9214,6 +9229,17 @@ int main(int argc, char** argv) {
     if (stop_soon) goto stop_fuzzing;
   }
 
+  socketsrv_pid = fork();
+  if (socketsrv_pid < 0){
+    PFATAL("fork() failed");
+  }
+  if (!socketsrv_pid){
+    // start the sockect server
+    if (startSocketSrv(use_argv) < 0 ) {
+      PFATAL("start socket server failed");
+    }
+  }
+
   while (1) {
 
     u8 skipped_fuzz;
@@ -9255,15 +9281,6 @@ int main(int argc, char** argv) {
         sync_fuzzers(use_argv);
 
     }
-    socketsrv_pid = fork();
-    if (socketsrv_pid < 0){
-        PFATAL("fork() failed");
-    }
-    if (!socketsrv_pid){
-        // start the sockect server
-        startSocketSrv(use_argv);
-    }
-
       skipped_fuzz = fuzz_one(use_argv);
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
