@@ -6023,11 +6023,11 @@ void printBuffer(void * buffer, size_t len)
   printf("\n");
 }
 
-int readmsg(int sock, char* input, int* inputlen, int* offset, int* offsetSize)
+int readmsg(int sock, u8* input, size_t* inputlen, u32* offset, size_t* offsetSize)
 {
-  int length = 0;
+  u32 length = 0;
   char opcode;
-  if(!read(sock, &length, sizeof(int))){
+  if(!read(sock, &length, sizeof(u32))){
     printf("connection reset by the client \n");
     return 0;
   }
@@ -6048,7 +6048,7 @@ int readmsg(int sock, char* input, int* inputlen, int* offset, int* offsetSize)
   }
   if (opcode == 0x02){
     // read input length
-    readNext(inputlen, &buffer, sizeof(int));
+    readNext(inputlen, &buffer, sizeof(u32));
     // read input
     if (*inputlen + 9 >= length) {
       printf("length<0x%x> and inputlen<0x%x> are invalid \n", length, *inputlen);
@@ -6056,13 +6056,13 @@ int readmsg(int sock, char* input, int* inputlen, int* offset, int* offsetSize)
     }
     readNext(input, &buffer, *inputlen);
     // read blocked offset length
-    readNext(offsetSize, &buffer, sizeof(int));
-    if (*inputlen + *offsetSize * sizeof(int) + 9 != length){
+    readNext(offsetSize, &buffer, sizeof(u32));
+    if (*inputlen + *offsetSize * sizeof(u32) + 9 != length){
       printf("length<0x%x>, inputlen<0x%x> and offsetSize<0x%x> are invalid \n", length, *inputlen, *offsetSize);
       return 0;
     }
     // read blocked offset
-    readNext(offset, &buffer, *offsetSize * sizeof(int));
+    readNext(offset, &buffer, *offsetSize * sizeof(u32));
     return 1;
   }
   printf("opcode<0x%x> is invalid \n", opcode);
@@ -6090,8 +6090,8 @@ int makeReplyMsg(double entropy, char* clnt_buf)
 int startSocketSrv(char** argv) {
   socklen_t clnt_len;
   int orig_sock, new_sock;
-  int* blocked_offset;
-  char* input;
+  u32* blocked_offset;
+  u8* input;
   static struct sockaddr_in clnt_adr, serv_adr;
   const int PORT = 7777;
 
@@ -6125,10 +6125,10 @@ int startSocketSrv(char** argv) {
       FATAL("accept error");
       return -1;
     }
-    input = calloc(MAXSOCKECTPKG, sizeof(char));
-    blocked_offset = calloc(MAXSOCKECTPKG, sizeof(int));
-    int inputlen = 0;
-    int offsetSize = 0;
+    input = calloc(MAXSOCKECTPKG, sizeof(u8));
+    blocked_offset = calloc(MAXSOCKECTPKG, sizeof(u32));
+    size_t inputlen = 0;
+    size_t offsetSize = 0;
     int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offsetSize);
     if (status < 0) {
       free(input);
@@ -6145,7 +6145,7 @@ int startSocketSrv(char** argv) {
       continue;
     }
     double entropy = 0;
-    // for debug
+//  for debug
 //    printf("\n");
 //    printBuffer(input, inputlen);
 //    for (int i=0;i<offsetSize;i++){
