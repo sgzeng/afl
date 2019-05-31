@@ -47,7 +47,7 @@
 #include <termios.h>
 #include <dlfcn.h>
 #include <sched.h>
-
+#include <math.h>
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/shm.h>
@@ -60,6 +60,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
+#include <assert.h>
+
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -6064,7 +6066,7 @@ abandon_entry:
   while ((key = map_next(&coverage_distribution_map, &iter))) {
     int count = map_get(&coverage_distribution_map, key);
     probability = count / size;
-    entropy += - (probability * log2n(probability));
+    entropy -= probability * log2(probability);
   }
   map_deinit(&coverage_distribution_map);
   return ret_val;
