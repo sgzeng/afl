@@ -45,7 +45,7 @@
 #include <termios.h>
 #include <dlfcn.h>
 #include <sched.h>
-
+#include <string.h>
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/shm.h>
@@ -55,6 +55,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <assert.h>
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -135,7 +136,7 @@ static s32 forksrv_pid,               /* PID of the fork server           */
            out_dir_fd = -1;           /* FD of the lock file              */
 
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
-
+FILE *fp;
 EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
            virgin_tmout[MAP_SIZE],    /* Bits we haven't seen in tmouts   */
            virgin_crash[MAP_SIZE];    /* Bits we haven't seen in crashes  */
@@ -4595,16 +4596,16 @@ abort_trimming:
 //  }
 //}
 
-EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u32 buf_len){
+/* return false: avoid mutate
+ * return true: do mutate*/
+EXP_ST bool check_bl_offset(u32 *bl_set, size_t bl_len, u8 *in_buf, u8 *out_buf, u32 stage_cur_byte){
   // check if bl_set is valid against out_buf
   for(u32 i=0; i<bl_len; i++){
-    if(bl_set[i] >= buf_len){
-      // handle error
+    if(bl_set[i] > stage_cur_byte){
       return true;
     }
-    // xor only the bit in bl_set between in_buf and out_buf
-    u32 position = bl_set[i] >> 3;
-    if(in_buf[position] ^ out_buf[position]){
+    // xor only the byte in bl_set between in_buf and out_buf
+    if( stage_cur_byte == bl_set[i] && in_buf[stage_cur_byte] ^ out_buf[stage_cur_byte]){
       return false;
     }
   }
@@ -4616,6 +4617,18 @@ EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u3
    a helper function for fuzz_one(). */
 
 EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
+  // for debug
+  fp = fopen("my.log", "a+");
+  if (fp != NULL)
+  {
+//    fputs("###############\n", fp);
+    fwrite(out_buf, sizeof(u8), len, fp);
+//    fputs("###############\n", fp);
+    fclose(fp);
+  }
+  if (out_buf[6] != 0x41){
+    assert(false);
+  }
 
   u8 fault;
 
@@ -4972,10 +4985,7 @@ static u8 fuzz_one(char** argv) {
 
   // a set of blacklist offset
   // avoid mutating those bytes during fuzzing
-  u32 test_set[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, \
-  17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, \
-  36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, \
-  55, 56, 57, 58, 59, 60, 61, 62, 63};
+  u32 test_set[] = {0, 6};
   u32* bl_bit_set = test_set;
 
   s32 len, fd, temp_len, i, j;
@@ -5084,25 +5094,25 @@ static u8 fuzz_one(char** argv) {
    * TRIMMING *
    ************/
 
-  if (!dumb_mode && !queue_cur->trim_done) {
-
-    u8 res = trim_case(argv, queue_cur, in_buf);
-
-    if (res == FAULT_ERROR)
-      FATAL("Unable to execute target application");
-
-    if (stop_soon) {
-      cur_skipped_paths++;
-      goto abandon_entry;
-    }
-
-    /* Don't retry trimming, even if it failed. */
-
-    queue_cur->trim_done = 1;
-
-    if (len != queue_cur->len) len = queue_cur->len;
-
-  }
+//  if (!dumb_mode && !queue_cur->trim_done) {
+//
+//    u8 res = trim_case(argv, queue_cur, in_buf);
+//
+//    if (res == FAULT_ERROR)
+//      FATAL("Unable to execute target application");
+//
+//    if (stop_soon) {
+//      cur_skipped_paths++;
+//      goto abandon_entry;
+//    }
+//
+//    /* Don't retry trimming, even if it failed. */
+//
+//    queue_cur->trim_done = 1;
+//
+//    if (len != queue_cur->len) len = queue_cur->len;
+//
+//  }
 
   memcpy(out_buf, in_buf, len);
 
@@ -5156,7 +5166,7 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur);
 
     // check and restore bits in the offset blacklist
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     }
 
@@ -5251,7 +5261,7 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     }
 
@@ -5282,7 +5292,7 @@ static u8 fuzz_one(char** argv) {
     FLIP_BIT(out_buf, stage_cur + 2);
     FLIP_BIT(out_buf, stage_cur + 3);
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     }
 
@@ -5335,7 +5345,7 @@ static u8 fuzz_one(char** argv) {
     stage_cur_byte = stage_cur;
 
     out_buf[stage_cur] ^= 0xFF;
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     }
 
@@ -5415,9 +5425,11 @@ static u8 fuzz_one(char** argv) {
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     }
+
     stage_cur++;
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
@@ -5454,9 +5466,13 @@ static u8 fuzz_one(char** argv) {
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
+       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
+       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     }
+
     stage_cur++;
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
@@ -5512,7 +5528,7 @@ skip_bitflip:
         stage_cur_val = j;
         out_buf[i] = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
         stage_cur++;
@@ -5526,7 +5542,7 @@ skip_bitflip:
         stage_cur_val = -j;
         out_buf[i] = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
         stage_cur++;
@@ -5587,9 +5603,11 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
+
         stage_cur++;
  
       } else stage_max--;
@@ -5599,9 +5617,11 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
+
         stage_cur++;
 
       } else stage_max--;
@@ -5616,9 +5636,11 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) + j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
+
         stage_cur++;
 
       } else stage_max--;
@@ -5628,9 +5650,11 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) - j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
+
         stage_cur++;
 
       } else stage_max--;
@@ -5688,9 +5712,13 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
+
         stage_cur++;
 
       } else stage_max--;
@@ -5700,9 +5728,13 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
+
         stage_cur++;
 
       } else stage_max--;
@@ -5716,9 +5748,13 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) + j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
+
         stage_cur++;
 
       } else stage_max--;
@@ -5728,9 +5764,13 @@ skip_bitflip:
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) - j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
+
         stage_cur++;
 
       } else stage_max--;
@@ -5789,7 +5829,7 @@ skip_arith:
       stage_cur_val = interesting_8[j];
       out_buf[i] = interesting_8[j];
 
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
 
@@ -5806,8 +5846,6 @@ skip_arith:
   stage_cycles[STAGE_INTEREST8] += stage_max;
 
   /* Setting 16-bit integers, both endians. */
-
-  if (no_arith || len < 2) goto skip_interest;
 
   stage_name  = "interest 16/8";
   stage_short = "int16";
@@ -5844,7 +5882,8 @@ skip_arith:
 
         *(u16*)(out_buf + i) = interesting_16[j];
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
         stage_cur++;
@@ -5859,7 +5898,8 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u16*)(out_buf + i) = SWAP16(interesting_16[j]);
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
         stage_cur++;
@@ -5876,8 +5916,6 @@ skip_arith:
 
   stage_finds[STAGE_INTEREST16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST16] += stage_max;
-
-  if (len < 4) goto skip_interest;
 
   /* Setting 32-bit integers, both endians. */
 
@@ -5916,8 +5954,10 @@ skip_arith:
         stage_val_type = STAGE_VAL_LE;
 
         *(u32*)(out_buf + i) = interesting_32[j];
-
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
         stage_cur++;
@@ -5932,7 +5972,10 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u32*)(out_buf + i) = SWAP32(interesting_32[j]);
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
+        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
+                check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
+                check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
+                check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
           if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         }
         stage_cur++;
@@ -5950,179 +5993,9 @@ skip_arith:
   stage_finds[STAGE_INTEREST32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST32] += stage_max;
 
-skip_interest:
-
   /********************
    * DICTIONARY STUFF *
    ********************/
-
-  if (!extras_cnt) goto skip_user_extras;
-
-  /* Overwrite with user-supplied extras. */
-
-  stage_name  = "user extras (over)";
-  stage_short = "ext_UO";
-  stage_cur   = 0;
-  stage_max   = extras_cnt * len;
-
-  stage_val_type = STAGE_VAL_NONE;
-
-  orig_hit_cnt = new_hit_cnt;
-
-  for (i = 0; i < len; i++) {
-
-    u32 last_len = 0;
-
-    stage_cur_byte = i;
-
-    /* Extras are sorted by size, from smallest to largest. This means
-       that we don't have to worry about restoring the buffer in
-       between writes at a particular offset determined by the outer
-       loop. */
-
-    for (j = 0; j < extras_cnt; j++) {
-
-      /* Skip extras probabilistically if extras_cnt > MAX_DET_EXTRAS. Also
-         skip them if there's no room to insert the payload, if the token
-         is redundant, or if its entire span has no bytes set in the effector
-         map. */
-
-      if ((extras_cnt > MAX_DET_EXTRAS && UR(extras_cnt) >= MAX_DET_EXTRAS) ||
-          extras[j].len > len - i ||
-          !memcmp(extras[j].data, out_buf + i, extras[j].len) ||
-          !memchr(eff_map + EFF_APOS(i), 1, EFF_SPAN_ALEN(i, extras[j].len))) {
-
-        stage_max--;
-        continue;
-
-      }
-
-      last_len = extras[j].len;
-      memcpy(out_buf + i, extras[j].data, last_len);
-
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
-
-      stage_cur++;
-
-    }
-
-    /* Restore all the clobbered memory. */
-    memcpy(out_buf + i, in_buf + i, last_len);
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_EXTRAS_UO]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_EXTRAS_UO] += stage_max;
-
-  /* Insertion of user-supplied extras. */
-
-  stage_name  = "user extras (insert)";
-  stage_short = "ext_UI";
-  stage_cur   = 0;
-  stage_max   = extras_cnt * len;
-
-  orig_hit_cnt = new_hit_cnt;
-
-  ex_tmp = ck_alloc(len + MAX_DICT_FILE);
-
-  for (i = 0; i <= len; i++) {
-
-    stage_cur_byte = i;
-
-    for (j = 0; j < extras_cnt; j++) {
-
-      if (len + extras[j].len > MAX_FILE) {
-        stage_max--; 
-        continue;
-      }
-
-      /* Insert token */
-      memcpy(ex_tmp + i, extras[j].data, extras[j].len);
-
-      /* Copy tail */
-      memcpy(ex_tmp + i + extras[j].len, out_buf + i, len - i);
-
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-        if (common_fuzz_stuff(argv, ex_tmp, len + extras[j].len)) {
-          ck_free(ex_tmp);
-          goto abandon_entry;
-        }
-      }
-
-      stage_cur++;
-
-    }
-
-    /* Copy head */
-    ex_tmp[i] = out_buf[i];
-
-  }
-
-  ck_free(ex_tmp);
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_EXTRAS_UI]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_EXTRAS_UI] += stage_max;
-
-skip_user_extras:
-
-  if (!a_extras_cnt) goto skip_extras;
-
-  stage_name  = "auto extras (over)";
-  stage_short = "ext_AO";
-  stage_cur   = 0;
-  stage_max   = MIN(a_extras_cnt, USE_AUTO_EXTRAS) * len;
-
-  stage_val_type = STAGE_VAL_NONE;
-
-  orig_hit_cnt = new_hit_cnt;
-
-  for (i = 0; i < len; i++) {
-
-    u32 last_len = 0;
-
-    stage_cur_byte = i;
-
-    for (j = 0; j < MIN(a_extras_cnt, USE_AUTO_EXTRAS); j++) {
-
-      /* See the comment in the earlier code; extras are sorted by size. */
-
-      if (a_extras[j].len > len - i ||
-          !memcmp(a_extras[j].data, out_buf + i, a_extras[j].len) ||
-          !memchr(eff_map + EFF_APOS(i), 1, EFF_SPAN_ALEN(i, a_extras[j].len))) {
-
-        stage_max--;
-        continue;
-
-      }
-
-      last_len = a_extras[j].len;
-      memcpy(out_buf + i, a_extras[j].data, last_len);
-
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        }
-
-      stage_cur++;
-
-    }
-
-    /* Restore all the clobbered memory. */
-    memcpy(out_buf + i, in_buf + i, last_len);
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  stage_finds[STAGE_EXTRAS_AO]  += new_hit_cnt - orig_hit_cnt;
-  stage_cycles[STAGE_EXTRAS_AO] += stage_max;
-
-skip_extras:
 
   /* If we made this to here without jumping to havoc_stage or abandon_entry,
      we're properly done with deterministic steps and can mark it as such
@@ -6133,462 +6006,7 @@ skip_extras:
   /****************
    * RANDOM HAVOC *
    ****************/
-
 havoc_stage:
-
-  stage_cur_byte = -1;
-
-  /* The havoc stage mutation code is also invoked when splicing files; if the
-     splice_cycle variable is set, generate different descriptions and such. */
-
-  if (!splice_cycle) {
-
-    stage_name  = "havoc";
-    stage_short = "havoc";
-    stage_max   = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
-                  perf_score / havoc_div / 100;
-
-  } else {
-
-    static u8 tmp[32];
-
-    perf_score = orig_perf;
-
-    sprintf(tmp, "splice %u", splice_cycle);
-    stage_name  = tmp;
-    stage_short = "splice";
-    stage_max   = SPLICE_HAVOC * perf_score / havoc_div / 100;
-
-  }
-
-  if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
-
-  temp_len = len;
-
-  orig_hit_cnt = queued_paths + unique_crashes;
-
-  havoc_queued = queued_paths;
-
-  /* We essentially just do several thousand runs (depending on perf_score)
-     where we take the input file and make random stacked tweaks. */
-
-  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
-
-    u32 use_stacking = 1 << (1 + UR(HAVOC_STACK_POW2));
-
-    stage_cur_val = use_stacking;
- 
-    for (i = 0; i < use_stacking; i++) {
-
-      switch (UR(15 + ((extras_cnt + a_extras_cnt) ? 2 : 0))) {
-
-        case 0:
-
-          /* Flip a single bit somewhere. Spooky! */
-
-          FLIP_BIT(out_buf, UR(temp_len << 3));
-          break;
-
-        case 1: 
-
-          /* Set byte to interesting value. */
-
-          out_buf[UR(temp_len)] = interesting_8[UR(sizeof(interesting_8))];
-          break;
-
-        case 2:
-
-          /* Set word to interesting value, randomly choosing endian. */
-
-          if (temp_len < 2) break;
-
-          if (UR(2)) {
-
-            *(u16*)(out_buf + UR(temp_len - 1)) =
-              interesting_16[UR(sizeof(interesting_16) >> 1)];
-
-          } else {
-
-            *(u16*)(out_buf + UR(temp_len - 1)) = SWAP16(
-              interesting_16[UR(sizeof(interesting_16) >> 1)]);
-
-          }
-
-          break;
-
-        case 3:
-
-          /* Set dword to interesting value, randomly choosing endian. */
-
-          if (temp_len < 4) break;
-
-          if (UR(2)) {
-  
-            *(u32*)(out_buf + UR(temp_len - 3)) =
-              interesting_32[UR(sizeof(interesting_32) >> 2)];
-
-          } else {
-
-            *(u32*)(out_buf + UR(temp_len - 3)) = SWAP32(
-              interesting_32[UR(sizeof(interesting_32) >> 2)]);
-
-          }
-
-          break;
-
-        case 4:
-
-          /* Randomly subtract from byte. */
-
-          out_buf[UR(temp_len)] -= 1 + UR(ARITH_MAX);
-          break;
-
-        case 5:
-
-          /* Randomly add to byte. */
-
-          out_buf[UR(temp_len)] += 1 + UR(ARITH_MAX);
-          break;
-
-        case 6:
-
-          /* Randomly subtract from word, random endian. */
-
-          if (temp_len < 2) break;
-
-          if (UR(2)) {
-
-            u32 pos = UR(temp_len - 1);
-
-            *(u16*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
-
-          } else {
-
-            u32 pos = UR(temp_len - 1);
-            u16 num = 1 + UR(ARITH_MAX);
-
-            *(u16*)(out_buf + pos) =
-              SWAP16(SWAP16(*(u16*)(out_buf + pos)) - num);
-
-          }
-
-          break;
-
-        case 7:
-
-          /* Randomly add to word, random endian. */
-
-          if (temp_len < 2) break;
-
-          if (UR(2)) {
-
-            u32 pos = UR(temp_len - 1);
-
-            *(u16*)(out_buf + pos) += 1 + UR(ARITH_MAX);
-
-          } else {
-
-            u32 pos = UR(temp_len - 1);
-            u16 num = 1 + UR(ARITH_MAX);
-
-            *(u16*)(out_buf + pos) =
-              SWAP16(SWAP16(*(u16*)(out_buf + pos)) + num);
-
-          }
-
-          break;
-
-        case 8:
-
-          /* Randomly subtract from dword, random endian. */
-
-          if (temp_len < 4) break;
-
-          if (UR(2)) {
-
-            u32 pos = UR(temp_len - 3);
-
-            *(u32*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
-
-          } else {
-
-            u32 pos = UR(temp_len - 3);
-            u32 num = 1 + UR(ARITH_MAX);
-
-            *(u32*)(out_buf + pos) =
-              SWAP32(SWAP32(*(u32*)(out_buf + pos)) - num);
-
-          }
-
-          break;
-
-        case 9:
-
-          /* Randomly add to dword, random endian. */
-
-          if (temp_len < 4) break;
-
-          if (UR(2)) {
-
-            u32 pos = UR(temp_len - 3);
-
-            *(u32*)(out_buf + pos) += 1 + UR(ARITH_MAX);
-
-          } else {
-
-            u32 pos = UR(temp_len - 3);
-            u32 num = 1 + UR(ARITH_MAX);
-
-            *(u32*)(out_buf + pos) =
-              SWAP32(SWAP32(*(u32*)(out_buf + pos)) + num);
-
-          }
-
-          break;
-
-        case 10:
-
-          /* Just set a random byte to a random value. Because,
-             why not. We use XOR with 1-255 to eliminate the
-             possibility of a no-op. */
-
-          out_buf[UR(temp_len)] ^= 1 + UR(255);
-          break;
-
-        case 11 ... 12: {
-
-            /* Delete bytes. We're making this a bit more likely
-               than insertion (the next option) in hopes of keeping
-               files reasonably small. */
-
-            u32 del_from, del_len;
-
-            if (temp_len < 2) break;
-
-            /* Don't delete too much. */
-
-            del_len = choose_block_len(temp_len - 1);
-
-            del_from = UR(temp_len - del_len + 1);
-
-            memmove(out_buf + del_from, out_buf + del_from + del_len,
-                    temp_len - del_from - del_len);
-
-            temp_len -= del_len;
-
-            break;
-
-          }
-
-        case 13:
-
-          if (temp_len + HAVOC_BLK_XL < MAX_FILE) {
-
-            /* Clone bytes (75%) or insert a block of constant bytes (25%). */
-
-            u8  actually_clone = UR(4);
-            u32 clone_from, clone_to, clone_len;
-            u8* new_buf;
-
-            if (actually_clone) {
-
-              clone_len  = choose_block_len(temp_len);
-              clone_from = UR(temp_len - clone_len + 1);
-
-            } else {
-
-              clone_len = choose_block_len(HAVOC_BLK_XL);
-              clone_from = 0;
-
-            }
-
-            clone_to   = UR(temp_len);
-
-            new_buf = ck_alloc_nozero(temp_len + clone_len);
-
-            /* Head */
-
-            memcpy(new_buf, out_buf, clone_to);
-
-            /* Inserted part */
-
-            if (actually_clone)
-              memcpy(new_buf + clone_to, out_buf + clone_from, clone_len);
-            else
-              memset(new_buf + clone_to,
-                     UR(2) ? UR(256) : out_buf[UR(temp_len)], clone_len);
-
-            /* Tail */
-            memcpy(new_buf + clone_to + clone_len, out_buf + clone_to,
-                   temp_len - clone_to);
-
-            ck_free(out_buf);
-            out_buf = new_buf;
-            temp_len += clone_len;
-
-          }
-
-          break;
-
-        case 14: {
-
-            /* Overwrite bytes with a randomly selected chunk (75%) or fixed
-               bytes (25%). */
-
-            u32 copy_from, copy_to, copy_len;
-
-            if (temp_len < 2) break;
-
-            copy_len  = choose_block_len(temp_len - 1);
-
-            copy_from = UR(temp_len - copy_len + 1);
-            copy_to   = UR(temp_len - copy_len + 1);
-
-            if (UR(4)) {
-
-              if (copy_from != copy_to)
-                memmove(out_buf + copy_to, out_buf + copy_from, copy_len);
-
-            } else memset(out_buf + copy_to,
-                          UR(2) ? UR(256) : out_buf[UR(temp_len)], copy_len);
-
-            break;
-
-          }
-
-        /* Values 15 and 16 can be selected only if there are any extras
-           present in the dictionaries. */
-
-        case 15: {
-
-            /* Overwrite bytes with an extra. */
-
-            if (!extras_cnt || (a_extras_cnt && UR(2))) {
-
-              /* No user-specified extras or odds in our favor. Let's use an
-                 auto-detected one. */
-
-              u32 use_extra = UR(a_extras_cnt);
-              u32 extra_len = a_extras[use_extra].len;
-              u32 insert_at;
-
-              if (extra_len > temp_len) break;
-
-              insert_at = UR(temp_len - extra_len + 1);
-              memcpy(out_buf + insert_at, a_extras[use_extra].data, extra_len);
-
-            } else {
-
-              /* No auto extras or odds in our favor. Use the dictionary. */
-
-              u32 use_extra = UR(extras_cnt);
-              u32 extra_len = extras[use_extra].len;
-              u32 insert_at;
-
-              if (extra_len > temp_len) break;
-
-              insert_at = UR(temp_len - extra_len + 1);
-              memcpy(out_buf + insert_at, extras[use_extra].data, extra_len);
-
-            }
-
-            break;
-
-          }
-
-        case 16: {
-
-            u32 use_extra, extra_len, insert_at = UR(temp_len + 1);
-            u8* new_buf;
-
-            /* Insert an extra. Do the same dice-rolling stuff as for the
-               previous case. */
-
-            if (!extras_cnt || (a_extras_cnt && UR(2))) {
-
-              use_extra = UR(a_extras_cnt);
-              extra_len = a_extras[use_extra].len;
-
-              if (temp_len + extra_len >= MAX_FILE) break;
-
-              new_buf = ck_alloc_nozero(temp_len + extra_len);
-
-              /* Head */
-              memcpy(new_buf, out_buf, insert_at);
-
-              /* Inserted part */
-              memcpy(new_buf + insert_at, a_extras[use_extra].data, extra_len);
-
-            } else {
-
-              use_extra = UR(extras_cnt);
-              extra_len = extras[use_extra].len;
-
-              if (temp_len + extra_len >= MAX_FILE) break;
-
-              new_buf = ck_alloc_nozero(temp_len + extra_len);
-
-              /* Head */
-              memcpy(new_buf, out_buf, insert_at);
-
-              /* Inserted part */
-              memcpy(new_buf + insert_at, extras[use_extra].data, extra_len);
-
-            }
-
-            /* Tail */
-            memcpy(new_buf + insert_at + extra_len, out_buf + insert_at,
-                   temp_len - insert_at);
-
-            ck_free(out_buf);
-            out_buf   = new_buf;
-            temp_len += extra_len;
-
-            break;
-
-          }
-
-      }
-
-    }
-
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, len << 3)){
-      if (common_fuzz_stuff(argv, out_buf, temp_len))
-        goto abandon_entry;
-    }
-
-    /* out_buf might have been mangled a bit, so let's restore it to its
-       original size and shape. */
-
-    if (temp_len < len) out_buf = ck_realloc(out_buf, len);
-    temp_len = len;
-    memcpy(out_buf, in_buf, len);
-
-    /* If we're finding new stuff, let's run for a bit longer, limits
-       permitting. */
-
-    if (queued_paths != havoc_queued) {
-
-      if (perf_score <= HAVOC_MAX_MULT * 100) {
-        stage_max  *= 2;
-        perf_score *= 2;
-      }
-
-      havoc_queued = queued_paths;
-
-    }
-
-  }
-
-  new_hit_cnt = queued_paths + unique_crashes;
-
-  if (!splice_cycle) {
-    stage_finds[STAGE_HAVOC]  += new_hit_cnt - orig_hit_cnt;
-    stage_cycles[STAGE_HAVOC] += stage_max;
-  } else {
-    stage_finds[STAGE_SPLICE]  += new_hit_cnt - orig_hit_cnt;
-    stage_cycles[STAGE_SPLICE] += stage_max;
-  }
 
 #ifndef IGNORE_FINDS
 
@@ -6596,89 +6014,6 @@ havoc_stage:
    * SPLICING *
    ************/
 
-  /* This is a last-resort strategy triggered by a full round with no findings.
-     It takes the current input file, randomly selects another input, and
-     splices them together at some offset, then relies on the havoc
-     code to mutate that blob. */
-
-retry_splicing:
-
-  if (use_splicing && splice_cycle++ < SPLICE_CYCLES &&
-      queued_paths > 1 && queue_cur->len > 1) {
-
-    struct queue_entry* target;
-    u32 tid, split_at;
-    u8* new_buf;
-    s32 f_diff, l_diff;
-
-    /* First of all, if we've modified in_buf for havoc, let's clean that
-       up... */
-
-    if (in_buf != orig_in) {
-      ck_free(in_buf);
-      in_buf = orig_in;
-      len = queue_cur->len;
-    }
-
-    /* Pick a random queue entry and seek to it. Don't splice with yourself. */
-
-    do { tid = UR(queued_paths); } while (tid == current_entry);
-
-    splicing_with = tid;
-    target = queue;
-
-    while (tid >= 100) { target = target->next_100; tid -= 100; }
-    while (tid--) target = target->next;
-
-    /* Make sure that the target has a reasonable length. */
-
-    while (target && (target->len < 2 || target == queue_cur)) {
-      target = target->next;
-      splicing_with++;
-    }
-
-    if (!target) goto retry_splicing;
-
-    /* Read the testcase into a new buffer. */
-
-    fd = open(target->fname, O_RDONLY);
-
-    if (fd < 0) PFATAL("Unable to open '%s'", target->fname);
-
-    new_buf = ck_alloc_nozero(target->len);
-
-    ck_read(fd, new_buf, target->len, target->fname);
-
-    close(fd);
-
-    /* Find a suitable splicing location, somewhere between the first and
-       the last differing byte. Bail out if the difference is just a single
-       byte or so. */
-
-    locate_diffs(in_buf, new_buf, MIN(len, target->len), &f_diff, &l_diff);
-
-    if (f_diff < 0 || l_diff < 2 || f_diff == l_diff) {
-      ck_free(new_buf);
-      goto retry_splicing;
-    }
-
-    /* Split somewhere between the first and last differing byte. */
-
-    split_at = f_diff + UR(l_diff - f_diff);
-
-    /* Do the thing. */
-
-    len = target->len;
-    memcpy(new_buf, in_buf, split_at);
-    in_buf = new_buf;
-
-    ck_free(out_buf);
-    out_buf = ck_alloc_nozero(len);
-    memcpy(out_buf, in_buf, len);
-
-    goto havoc_stage;
-
-  }
 
 #endif /* !IGNORE_FINDS */
 
