@@ -27,7 +27,7 @@
 #define _FILE_OFFSET_BITS 64
 #define MAXSOCKECTPKG 2048
 
-#include "map.h"
+#include "uthash.h"
 #include "config.h"
 #include "types.h"
 #include "debug.h"
@@ -61,6 +61,7 @@
 #include <sys/un.h>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <math.h>
 
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
@@ -139,10 +140,15 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
 
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
-           socketsrv_pid = -1,        /* PID of the fork socket server           */
            out_dir_fd = -1;           /* FD of the lock file              */
 
-map_t(u32) coverage_distribution_map;
+struct my_struct {
+    u32 cov_id;                    /* key */
+    u32 count;
+    UT_hash_handle hh;         /* makes this structure hashable */
+};
+struct my_struct *coverage_distribution_map = NULL;
+
 EXP_ST u8 slave_mode = 0;
 
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
@@ -332,6 +338,43 @@ enum {
   /* 05 */ FAULT_NOBITS
 };
 
+// map_set
+static void map_set(u32 cov_id, u32 count) {
+  struct my_struct *s;
+
+  HASH_FIND_INT(coverage_distribution_map, &cov_id, s);
+  if (s==NULL) {
+    s = (struct my_struct *)malloc(sizeof *s);
+    s->cov_id = cov_id;
+    HASH_ADD_INT( coverage_distribution_map, cov_id, s );
+  }
+  s->count = count;
+}
+
+// map_get
+static struct my_struct *map_get(u32 cov_id) {
+  struct my_struct *s;
+  HASH_FIND_INT( coverage_distribution_map, &cov_id, s );
+  return s;
+}
+
+// map_free
+static void map_free() {
+  struct my_struct *current_map, *tmp;
+
+  HASH_ITER(hh, coverage_distribution_map, current_map, tmp) {
+    HASH_DEL(coverage_distribution_map, current_map);  /* delete it (users advances to next) */
+    free(current_map);             /* free it */
+  }
+}
+
+// map_print
+static void map_print(){
+  struct my_struct *m;
+  for(m=coverage_distribution_map; m != NULL; m=(struct my_struct*)(m->hh.next)) {
+    printf("cover id %u: count %u\n", m->cov_id, m->count);
+  }
+}
 
 /* Get unix time in milliseconds */
 
@@ -4590,22 +4633,6 @@ abort_trimming:
 
 }
 
-//EXP_ST void depress_mutation(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u32 buf_len){
-//  // check if bl_set is valid against out_buf
-//  for(u32 i=0; i<bl_len; i++){
-//    if(bl_set[i] >= buf_len){
-//      // handle error
-//      return;
-//    }
-//    // xor only the bit in bl_set between in_buf and out_buf
-//    u32 position = bl_set[i] >> 3;
-//    if(in_buf[position] ^ out_buf[position]){
-//      // restore to the original
-//      out_buf[bl_set[i]] = in_buf[bl_set[i]];
-//    }
-//  }
-//}
-
 /* return false: avoid mutate
  * return true: do mutate*/
 EXP_ST bool check_bl_offset(u32 *bl_set, size_t bl_len, u8 *in_buf, u8 *out_buf, u32 stage_cur_byte){
@@ -4627,6 +4654,15 @@ EXP_ST bool check_bl_offset(u32 *bl_set, size_t bl_len, u8 *in_buf, u8 *out_buf,
    a helper function for fuzz_one(). */
 
 EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
+  // for debug
+  FILE *fp = fopen("my.log", "a+");
+  if (fp != NULL)
+  {
+//    fputs("###############\n", fp);
+    fwrite(out_buf, sizeof(u8), len, fp);
+//    fputs("###############\n", fp);
+    fclose(fp);
+  }
 
   u8 fault;
   u32 checksum;
@@ -4642,12 +4678,12 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   fault = run_target(argv, exec_tmout);
   checksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
-  if(!map_get(&coverage_distribution_map, checksum)){
-    map_set(&coverage_distribution_map, checksum, 1);
+  if(!map_get(checksum)){
+    map_set(checksum, 1);
   }else {
-    int count = map_get(&coverage_distribution_map, checksum);
+    u32 count = map_get(checksum)->count;
     assert(count > 0);
-    map_set(&coverage_distribution_map, checksum, count+1);
+    map_set(checksum, count+1);
   }
 
   if (stop_soon) return 1;
@@ -5001,45 +5037,44 @@ static double computeEntropy(char** argv) {
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
-  map_init(&coverage_distribution_map);
 
-#ifdef IGNORE_FINDS
-
-  /* In IGNORE_FINDS mode, skip any entries that weren't in the
-     initial data set. */
-
-  if (queue_cur->depth > 1) return 1;
-
-#else
-
-  if (pending_favored) {
-
-    /* If we have any favored, non-fuzzed new arrivals in the queue,
-       possibly skip to them at the expense of already-fuzzed or non-favored
-       cases. */
-
-    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
-        UR(100) < SKIP_TO_NEW_PROB) return 1;
-
-  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
-
-    /* Otherwise, still possibly skip non-favored cases, albeit less often.
-       The odds of skipping stuff are higher for already-fuzzed inputs and
-       lower for never-fuzzed entries. */
-
-    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
-
-      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
-
-    } else {
-
-      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
-
-    }
-
-  }
-
-#endif /* ^IGNORE_FINDS */
+//#ifdef IGNORE_FINDS
+//
+//  /* In IGNORE_FINDS mode, skip any entries that weren't in the
+//     initial data set. */
+//
+//  if (queue_cur->depth > 1) return 1;
+//
+//#else
+//
+//  if (pending_favored) {
+//
+//    /* If we have any favored, non-fuzzed new arrivals in the queue,
+//       possibly skip to them at the expense of already-fuzzed or non-favored
+//       cases. */
+//
+//    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
+//        UR(100) < SKIP_TO_NEW_PROB) return 1;
+//
+//  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
+//
+//    /* Otherwise, still possibly skip non-favored cases, albeit less often.
+//       The odds of skipping stuff are higher for already-fuzzed inputs and
+//       lower for never-fuzzed entries. */
+//
+//    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
+//
+//      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
+//
+//    } else {
+//
+//      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
+//
+//    }
+//
+//  }
+//
+//#endif /* ^IGNORE_FINDS */
 
   if (not_on_tty) {
     ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...",
@@ -5126,18 +5161,18 @@ static double computeEntropy(char** argv) {
 
   orig_perf = perf_score = calculate_score(queue_cur);
 
-  /* Skip right away if -d is given, if we have done deterministic fuzzing on
-     this entry ourselves (was_fuzzed), or if it has gone through deterministic
-     testing in earlier, resumed runs (passed_det). */
-
-  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
-    goto havoc_stage;
-
-  /* Skip deterministic fuzzing if exec path checksum puts this out of scope
-     for this master instance. */
-
-  if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
-    goto havoc_stage;
+//  /* Skip right away if -d is given, if we have done deterministic fuzzing on
+//     this entry ourselves (was_fuzzed), or if it has gone through deterministic
+//     testing in earlier, resumed runs (passed_det). */
+//
+//  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
+//    goto havoc_stage;
+//
+//  /* Skip deterministic fuzzing if exec path checksum puts this out of scope
+//     for this master instance. */
+//
+//  if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
+//    goto havoc_stage;
 
   doing_det = 1;
 
@@ -5411,7 +5446,7 @@ static double computeEntropy(char** argv) {
 
   /* Two walking bytes. */
 
-  if (len < 2) goto skip_bitflip;
+  if (len < 2) goto skip_bitflip_entropy;
 
   stage_name  = "bitflip 16/8";
   stage_short = "flip16";
@@ -5450,7 +5485,7 @@ static double computeEntropy(char** argv) {
   stage_finds[STAGE_FLIP16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP16] += stage_max;
 
-  if (len < 4) goto skip_bitflip;
+  if (len < 4) goto skip_bitflip_entropy;
 
   /* Four walking bytes. */
 
@@ -5492,9 +5527,9 @@ static double computeEntropy(char** argv) {
   stage_finds[STAGE_FLIP32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP32] += stage_max;
 
-skip_bitflip:
+skip_bitflip_entropy:
 
-  if (no_arith) goto skip_arith;
+  if (no_arith) goto skip_arith_entropy;
 
   /**********************
    * ARITHMETIC INC/DEC *
@@ -5570,7 +5605,7 @@ skip_bitflip:
 
   /* 16-bit arithmetics, both endians. */
 
-  if (len < 2) goto skip_arith;
+  if (len < 2) goto skip_arith_entropy;
 
   stage_name  = "arith 16/8";
   stage_short = "arith16";
@@ -5680,7 +5715,7 @@ skip_bitflip:
 
   /* 32-bit arithmetics, both endians. */
 
-  if (len < 4) goto skip_arith;
+  if (len < 4) goto skip_arith_entropy;
 
   stage_name  = "arith 32/8";
   stage_short = "arith32";
@@ -5794,7 +5829,7 @@ skip_bitflip:
   stage_finds[STAGE_ARITH32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_ARITH32] += stage_max;
 
-skip_arith:
+  skip_arith_entropy:
 
   /**********************
    * INTERESTING VALUES *
@@ -5855,7 +5890,7 @@ skip_arith:
 
   /* Setting 16-bit integers, both endians. */
 
-  if (no_arith || len < 2) goto skip_interest;
+  if (no_arith || len < 2) goto skip_interest_entropy;
 
   stage_name  = "interest 16/8";
   stage_short = "int16";
@@ -5927,7 +5962,7 @@ skip_arith:
   stage_finds[STAGE_INTEREST16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST16] += stage_max;
 
-  if (len < 4) goto skip_interest;
+  if (len < 4) goto skip_interest_entropy;
 
   /* Setting 32-bit integers, both endians. */
 
@@ -6005,7 +6040,7 @@ skip_arith:
   stage_finds[STAGE_INTEREST32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST32] += stage_max;
 
-skip_interest:
+skip_interest_entropy:
 
   /********************
    * DICTIONARY STUFF *
@@ -6020,7 +6055,7 @@ skip_interest:
   /****************
    * RANDOM HAVOC *
    ****************/
-havoc_stage:
+//havoc_stage:
 
 #ifndef IGNORE_FINDS
 
@@ -6033,7 +6068,7 @@ havoc_stage:
 
   ret_val = 0;
 
-abandon_entry:
+//abandon_entry_entropy:
 
   splicing_with = -1;
 
@@ -6052,23 +6087,26 @@ abandon_entry:
   ck_free(out_buf);
   ck_free(eff_map);
 
-  u32 key;
-  map_iter_t iter;
-  iter = map_iter(coverage_distribution_map);
-  // compute the size of map, need to changed
-  int size = 0;
-  while ((key = map_next(&coverage_distribution_map, &iter))) {
-    size++;
+  u32 size = 0;
+  struct my_struct *m;
+  for(m=coverage_distribution_map; m != NULL; m=(struct my_struct*)(m->hh.next)) {
+    size += m->count;
   }
-  iter = map_iter(coverage_distribution_map);
+  assert(size > 0);
   double entropy = 0;
   double probability=0;
-  while ((key = map_next(&coverage_distribution_map, &iter))) {
-    int count = map_get(&coverage_distribution_map, key);
+  for(m=coverage_distribution_map; m != NULL; m=(struct my_struct*)(m->hh.next)) {
+    u32 count = m->count;
     probability = count / size;
     entropy -= probability * log2(probability);
   }
-  map_deinit(&coverage_distribution_map);
+  // for debug
+  printf("entropy %lf\n", entropy);
+  printf("map size: %u\n", size);
+  map_print();
+  assert(false);
+
+  map_free();
   return ret_val;
 
 #undef FLIP_BIT
@@ -6089,7 +6127,7 @@ void printBuffer(void * buffer, size_t len)
   printf("\n");
 }
 
-int readmsg(int sock, u8* input, size_t* inputlen, u32* offset, size_t* offsetSize)
+int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offsetSize)
 {
   u32 length = 0;
   char opcode;
@@ -6117,14 +6155,14 @@ int readmsg(int sock, u8* input, size_t* inputlen, u32* offset, size_t* offsetSi
     readNext(inputlen, &buffer, sizeof(u32));
     // read input
     if (*inputlen + 9 >= length) {
-      printf("length<0x%x> and inputlen<0x%x> are invalid \n", length, *inputlen);
+      printf("length<%u> and inputlen<%u> are invalid \n", length, *inputlen);
       return 0;
     }
     readNext(input, &buffer, *inputlen);
     // read blocked offset length
     readNext(offsetSize, &buffer, sizeof(u32));
     if (*inputlen + *offsetSize * sizeof(u32) + 9 != length){
-      printf("length<0x%x>, inputlen<0x%x> and offsetSize<0x%x> are invalid \n", length, *inputlen, *offsetSize);
+      printf("length<%u>, inputlen<%u> and offsetSize<%u> are invalid \n", length, *inputlen, *offsetSize);
       return 0;
     }
     // read blocked offset
@@ -6193,8 +6231,8 @@ int startSocketSrv(char** argv) {
     }
     input = calloc(MAXSOCKECTPKG, sizeof(u8));
     blocked_offset = calloc(MAXSOCKECTPKG, sizeof(u32));
-    size_t inputlen = 0;
-    size_t offsetSize = 0;
+    u32 inputlen = 0;
+    u32 offsetSize = 0;
     int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offsetSize);
     if (status < 0) {
       free(input);
@@ -9296,18 +9334,6 @@ int main(int argc, char** argv) {
     start_time += 4000;
     if (stop_soon) goto stop_fuzzing;
   }
-  if(slave_mode){
-    socketsrv_pid = fork();
-    if (socketsrv_pid < 0){
-      PFATAL("fork() failed");
-    }
-    if (!socketsrv_pid){
-      // start the sockect server
-      if (startSocketSrv(use_argv) < 0 ) {
-        PFATAL("start socket server failed");
-      }
-    }
-  }
 
   while (1) {
 
@@ -9350,10 +9376,17 @@ int main(int argc, char** argv) {
         sync_fuzzers(use_argv);
 
     }
+    if(slave_mode){
+      skipped_fuzz = computeEntropy(use_argv);
+//      if (startSocketSrv(use_argv) < 0 ) {
+//        PFATAL("start socket server failed");
+//      }
+    }else{
       skipped_fuzz = fuzz_one(use_argv);
+    }
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
-      
+
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
         sync_fuzzers(use_argv);
 
