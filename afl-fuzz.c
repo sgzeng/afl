@@ -4635,7 +4635,7 @@ abort_trimming:
 
 /* return false: avoid mutate
  * return true: do mutate*/
-EXP_ST bool check_bl_offset(u32 *bl_set, size_t bl_len, u8 *in_buf, u8 *out_buf, u32 stage_cur_byte){
+EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u32 stage_cur_byte){
   // check if bl_set is valid against out_buf
   for(u32 i=0; i<bl_len; i++){
     if(bl_set[i] > stage_cur_byte){
@@ -5021,19 +5021,14 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 
 /* Determinisitc sampling, return the computed entropy*/
-static double computeEntropy(char** argv) {
-
-  // a set of blacklist offset
-  // avoid mutating those bytes during fuzzing
-  u32 test_set[] = {0, 6, 7};
-  u32* bl_bit_set = test_set;
+static double computeEntropy(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
   u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
   u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
 
-  u8  ret_val = 1, doing_det = 0;
+//  u8  ret_val = 1, doing_det = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
@@ -5084,18 +5079,9 @@ static double computeEntropy(char** argv) {
 
   /* Map the test case into memory. */
 
-  fd = open(queue_cur->fname, O_RDONLY);
-
-  if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
-
-  len = queue_cur->len;
-
-  orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-
-  if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
-
-  close(fd);
-
+  len = input_len;
+  orig_in = in_buf = malloc(len*sizeof(u8));
+  memcpy(orig_in, input, len);
   /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
      single byte anyway, so it wouldn't give us any performance or memory usage
      benefits. */
@@ -5174,7 +5160,7 @@ static double computeEntropy(char** argv) {
 //  if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
 //    goto havoc_stage;
 
-  doing_det = 1;
+//  doing_det = 1;
 
   /*********************************************
    * SIMPLE BITFLIP (+dictionary construction) *
@@ -5205,7 +5191,7 @@ static double computeEntropy(char** argv) {
     FLIP_BIT(out_buf, stage_cur);
 
     // check and restore bits in the offset blacklist
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte)){
       common_fuzz_stuff(argv, out_buf, len);
     }
 
@@ -5300,8 +5286,8 @@ static double computeEntropy(char** argv) {
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur >> 3) &&
-       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, (stage_cur + 1) >> 3)){
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur >> 3) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur + 1) >> 3)){
       common_fuzz_stuff(argv, out_buf, len);
     }
 
@@ -5332,10 +5318,10 @@ static double computeEntropy(char** argv) {
     FLIP_BIT(out_buf, stage_cur + 2);
     FLIP_BIT(out_buf, stage_cur + 3);
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, (stage_cur) >> 3) &&
-       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, (stage_cur + 1) >> 3) &&
-       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, (stage_cur + 2) >> 3) &&
-       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, (stage_cur + 3) >> 3)){
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur) >> 3) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur + 1) >> 3) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur + 2) >> 3) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur + 3) >> 3)){
       common_fuzz_stuff(argv, out_buf, len);
     }
 
@@ -5388,7 +5374,7 @@ static double computeEntropy(char** argv) {
     stage_cur_byte = stage_cur;
 
     out_buf[stage_cur] ^= 0xFF;
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte)){
       common_fuzz_stuff(argv, out_buf, len);
     }
 
@@ -5468,8 +5454,8 @@ static double computeEntropy(char** argv) {
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1)){
       common_fuzz_stuff(argv, out_buf, len);
     }
 
@@ -5509,10 +5495,10 @@ static double computeEntropy(char** argv) {
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
 
-    if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
-       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
-       check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 2) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 3)){
       common_fuzz_stuff(argv, out_buf, len);
     }
 
@@ -5571,7 +5557,7 @@ skip_bitflip_entropy:
         stage_cur_val = j;
         out_buf[i] = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte)){
           common_fuzz_stuff(argv, out_buf, len);
         }
         stage_cur++;
@@ -5585,7 +5571,7 @@ skip_bitflip_entropy:
         stage_cur_val = -j;
         out_buf[i] = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte)){
           common_fuzz_stuff(argv, out_buf, len);
         }
         stage_cur++;
@@ -5646,8 +5632,8 @@ skip_bitflip_entropy:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1)){
           common_fuzz_stuff(argv, out_buf, len);
         }
 
@@ -5660,8 +5646,8 @@ skip_bitflip_entropy:
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1)){
           common_fuzz_stuff(argv, out_buf, len);
         }
 
@@ -5679,8 +5665,8 @@ skip_bitflip_entropy:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) + j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1)){
           common_fuzz_stuff(argv, out_buf, len);
         }
 
@@ -5693,8 +5679,8 @@ skip_bitflip_entropy:
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) - j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1)){
           common_fuzz_stuff(argv, out_buf, len);
         }
 
@@ -5755,10 +5741,10 @@ skip_bitflip_entropy:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = orig + j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 3)){
           common_fuzz_stuff(argv, out_buf, len);
         }
 
@@ -5771,10 +5757,10 @@ skip_bitflip_entropy:
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = orig - j;
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 3)){
           common_fuzz_stuff(argv, out_buf, len);
         }
 
@@ -5791,10 +5777,10 @@ skip_bitflip_entropy:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) + j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 3)){
           common_fuzz_stuff(argv, out_buf, len);
         }
 
@@ -5807,10 +5793,10 @@ skip_bitflip_entropy:
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) - j);
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 3)){
           common_fuzz_stuff(argv, out_buf, len);
         }
 
@@ -5872,7 +5858,7 @@ skip_bitflip_entropy:
       stage_cur_val = interesting_8[j];
       out_buf[i] = interesting_8[j];
 
-      if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte)){
+      if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte)){
         common_fuzz_stuff(argv, out_buf, len);
       }
 
@@ -5927,8 +5913,8 @@ skip_bitflip_entropy:
 
         *(u16*)(out_buf + i) = interesting_16[j];
 
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1)){
           common_fuzz_stuff(argv, out_buf, len);
         }
         stage_cur++;
@@ -5943,8 +5929,8 @@ skip_bitflip_entropy:
         stage_val_type = STAGE_VAL_BE;
 
         *(u16*)(out_buf + i) = SWAP16(interesting_16[j]);
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1)){
           common_fuzz_stuff(argv, out_buf, len);
         }
         stage_cur++;
@@ -6001,10 +5987,10 @@ skip_bitflip_entropy:
         stage_val_type = STAGE_VAL_LE;
 
         *(u32*)(out_buf + i) = interesting_32[j];
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 3)){
           common_fuzz_stuff(argv, out_buf, len);
         }
         stage_cur++;
@@ -6019,10 +6005,10 @@ skip_bitflip_entropy:
         stage_val_type = STAGE_VAL_BE;
 
         *(u32*)(out_buf + i) = SWAP32(interesting_32[j]);
-        if(check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 1) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 2) &&
-           check_bl_offset(bl_bit_set, sizeof(bl_bit_set), orig_in, out_buf, stage_cur_byte + 3)){
+        if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 2) &&
+           check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 3)){
           common_fuzz_stuff(argv, out_buf, len);
         }
         stage_cur++;
@@ -6066,8 +6052,6 @@ skip_interest_entropy:
 
 #endif /* !IGNORE_FINDS */
 
-  ret_val = 0;
-
 //abandon_entry_entropy:
 
   splicing_with = -1;
@@ -6101,13 +6085,13 @@ skip_interest_entropy:
     entropy -= probability * log2(probability);
   }
   // for debug
-  printf("entropy %lf\n", entropy);
-  printf("map size: %u\n", size);
-  map_print();
-  assert(false);
+//  printf("entropy %lf\n", entropy);
+//  printf("map size: %u\n", size);
+//  map_print();
+//  assert(false);
 
   map_free();
-  return ret_val;
+  return entropy;
 
 #undef FLIP_BIT
 
@@ -6127,7 +6111,7 @@ void printBuffer(void * buffer, size_t len)
   printf("\n");
 }
 
-int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offsetSize)
+int readmsg(int sock, u8* input, s32* inputlen, u32* offset, u32* offsetSize)
 {
   u32 length = 0;
   char opcode;
@@ -6152,17 +6136,17 @@ int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offsetSize)
   }
   if (opcode == 0x02){
     // read input length
-    readNext(inputlen, &buffer, sizeof(u32));
+    readNext(inputlen, &buffer, sizeof(s32));
     // read input
     if (*inputlen + 9 >= length) {
-      printf("length<%u> and inputlen<%u> are invalid \n", length, *inputlen);
+      printf("length<%u> and inputlen<%d> are invalid \n", length, *inputlen);
       return 0;
     }
     readNext(input, &buffer, *inputlen);
     // read blocked offset length
     readNext(offsetSize, &buffer, sizeof(u32));
     if (*inputlen + *offsetSize * sizeof(u32) + 9 != length){
-      printf("length<%u>, inputlen<%u> and offsetSize<%u> are invalid \n", length, *inputlen, *offsetSize);
+      printf("length<%u>, inputlen<%d> and offsetSize<%u> are invalid \n", length, *inputlen, *offsetSize);
       return 0;
     }
     // read blocked offset
@@ -6231,7 +6215,7 @@ int startSocketSrv(char** argv) {
     }
     input = calloc(MAXSOCKECTPKG, sizeof(u8));
     blocked_offset = calloc(MAXSOCKECTPKG, sizeof(u32));
-    u32 inputlen = 0;
+    s32 inputlen = 0;
     u32 offsetSize = 0;
     int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offsetSize);
     if (status < 0) {
@@ -6248,7 +6232,6 @@ int startSocketSrv(char** argv) {
       printf("Client abort, waiting for another request\n");
       continue;
     }
-    double entropy = 0;
 //  for debug
 //    printf("\n");
 //    printBuffer(input, inputlen);
@@ -6256,8 +6239,8 @@ int startSocketSrv(char** argv) {
 //      printf("%d ", blocked_offset[i]);
 //    }
 //    printf("\n");
-
-//    double entropy = computeEntropy(argv);
+// static double computeEntropy(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv)
+    double entropy = computeEntropy(input, inputlen, blocked_offset, offsetSize, argv);
     char clnt_buf[MAXSOCKECTPKG];
     int len = makeReplyMsg(entropy, clnt_buf);
     if(write(new_sock, clnt_buf, len) < 0) {
@@ -9335,8 +9318,7 @@ int main(int argc, char** argv) {
     if (stop_soon) goto stop_fuzzing;
   }
 
-  while (1) {
-
+  if(slave_mode){
     u8 skipped_fuzz;
 
     cull_queue();
@@ -9372,33 +9354,69 @@ int main(int argc, char** argv) {
 
       prev_queued = queued_paths;
 
-      if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
-        sync_fuzzers(use_argv);
-
     }
-    if(slave_mode){
-      skipped_fuzz = computeEntropy(use_argv);
-//      if (startSocketSrv(use_argv) < 0 ) {
-//        PFATAL("start socket server failed");
-//      }
-    }else{
+    if (startSocketSrv(use_argv) < 0 ) {
+      PFATAL("start socket server failed");
+    }
+  }else{
+    while (1) {
+
+      u8 skipped_fuzz;
+
+      cull_queue();
+
+      if (!queue_cur) {
+
+        queue_cycle++;
+        current_entry     = 0;
+        cur_skipped_paths = 0;
+        queue_cur         = queue;
+
+        while (seek_to) {
+          current_entry++;
+          seek_to--;
+          queue_cur = queue_cur->next;
+        }
+
+        show_stats();
+
+        if (not_on_tty) {
+          ACTF("Entering queue cycle %llu.", queue_cycle);
+          fflush(stdout);
+        }
+
+        /* If we had a full queue cycle with no new finds, try
+           recombination strategies next. */
+
+        if (queued_paths == prev_queued) {
+
+          if (use_splicing) cycles_wo_finds++; else use_splicing = 1;
+
+        } else cycles_wo_finds = 0;
+
+        prev_queued = queued_paths;
+
+        if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
+          sync_fuzzers(use_argv);
+
+      }
       skipped_fuzz = fuzz_one(use_argv);
+
+      if (!stop_soon && sync_id && !skipped_fuzz) {
+
+        if (!(sync_interval_cnt++ % SYNC_INTERVAL))
+          sync_fuzzers(use_argv);
+
+      }
+
+      if (!stop_soon && exit_1) stop_soon = 2;
+
+      if (stop_soon) break;
+
+      queue_cur = queue_cur->next;
+      current_entry++;
+
     }
-
-    if (!stop_soon && sync_id && !skipped_fuzz) {
-
-      if (!(sync_interval_cnt++ % SYNC_INTERVAL))
-        sync_fuzzers(use_argv);
-
-    }
-
-    if (!stop_soon && exit_1) stop_soon = 2;
-
-    if (stop_soon) break;
-
-    queue_cur = queue_cur->next;
-    current_entry++;
-
   }
 
   if (queue_cur) show_stats();
