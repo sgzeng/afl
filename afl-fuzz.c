@@ -6081,11 +6081,11 @@ skip_interest_entropy:
   double probability=0;
   for(m=coverage_distribution_map; m != NULL; m=(struct my_struct*)(m->hh.next)) {
     u32 count = m->count;
-    probability = count / size;
+    probability = (double)count / (double)size;
     entropy -= probability * log2(probability);
   }
   // for debug
-//  printf("entropy %lf\n", entropy);
+  printf("computed entropy: %lf \n", entropy);
 //  printf("map size: %u\n", size);
 //  map_print();
 //  assert(false);
@@ -6139,6 +6139,7 @@ int readmsg(int sock, u8* input, s32* inputlen, u32* offset, u32* offsetSize)
     readNext(inputlen, &buffer, sizeof(s32));
     // read input
     if (*inputlen + 9 >= length) {
+      printBuffer(input, length);
       printf("length<%u> and inputlen<%d> are invalid \n", length, *inputlen);
       return 0;
     }
@@ -6146,6 +6147,7 @@ int readmsg(int sock, u8* input, s32* inputlen, u32* offset, u32* offsetSize)
     // read blocked offset length
     readNext(offsetSize, &buffer, sizeof(u32));
     if (*inputlen + *offsetSize * sizeof(u32) + 9 != length){
+      printBuffer(input, length);
       printf("length<%u>, inputlen<%d> and offsetSize<%u> are invalid \n", length, *inputlen, *offsetSize);
       return 0;
     }
@@ -6239,7 +6241,6 @@ int startSocketSrv(char** argv) {
 //      printf("%d ", blocked_offset[i]);
 //    }
 //    printf("\n");
-// static double computeEntropy(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv)
     double entropy = computeEntropy(input, inputlen, blocked_offset, offsetSize, argv);
     char clnt_buf[MAXSOCKECTPKG];
     int len = makeReplyMsg(entropy, clnt_buf);

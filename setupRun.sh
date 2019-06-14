@@ -7,13 +7,6 @@ OPTION=$1
 AFL_PATH=$(pwd)
 
 cd $AFL_PATH
-rm ./my.log
-touch my.log
-rm -rf ./afl_out
-rm -rf ./afl_in
-mkdir ./afl_out
-mkdir ./afl_in
-echo "AAAAAAA" > ./afl_in/seed
 ####################################################################################
 ###########################/ The general cases /####################################
 ####################################################################################
@@ -32,6 +25,13 @@ export AFL_CMDLINE=/home/haochen/work/reinforcement_learning/target/afl_instrume
 export QSYM_CMDLINE=/home/haochen/work/reinforcement_learning/target/original_bins/CROMU_00030.elf
 ####################################################################################
 if [ "$OPTION" == "master" ] || [ "$OPTION" == "m" ] ; then
+    rm ./my.log
+    touch my.log
+    rm -rf ./afl_out
+    rm -rf ./afl_in
+    mkdir ./afl_out
+    mkdir ./afl_in
+    echo "AAAAAAA" > ./afl_in/seed
     # run AFL master
     $AFL_ROOT/afl-fuzz -M afl-master -m none -i $INPUT -o $OUTPUT -- $AFL_CMDLINE
 fi
