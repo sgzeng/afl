@@ -4655,14 +4655,14 @@ EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u3
 
 EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   // for debug
-  FILE *fp = fopen("my.log", "a+");
-  if (fp != NULL)
-  {
-//    fputs("###############\n", fp);
-    fwrite(out_buf, sizeof(u8), len, fp);
-//    fputs("###############\n", fp);
-    fclose(fp);
-  }
+//  FILE *fp = fopen("afl.log", "a+");
+//  if (fp != NULL)
+//  {
+////    fputs("###############\n", fp);
+//    fwrite(out_buf, sizeof(u8), len, fp);
+////    fputs("###############\n", fp);
+//    fclose(fp);
+//  }
 
   u8 fault;
   u32 checksum;
@@ -5021,7 +5021,10 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 
 /* Determinisitc sampling, return the computed entropy*/
-static double computeEntropy(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
+static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
+  if(input_len == bl_len){
+    return 0;
+  }
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
@@ -6076,6 +6079,13 @@ skip_interest_entropy:
   for(m=coverage_distribution_map; m != NULL; m=(struct my_struct*)(m->hh.next)) {
     size += m->count;
   }
+  // for debug
+  // printf("input received: ");
+  // printBuffer(orig_in, sizeof(u8) * len);
+  // printf("blocked offset: ");
+  // printBuffer(bl_bit_set, sizeof(u32) * bl_len);
+  // printf("map size: %u\n", size);
+  // map_print();
   assert(size > 0);
   double entropy = 0;
   double probability=0;
@@ -6086,9 +6096,6 @@ skip_interest_entropy:
   }
   // for debug
   printf("computed entropy: %lf \n", entropy);
-//  printf("map size: %u\n", size);
-//  map_print();
-//  assert(false);
 
   map_free();
   return entropy;
@@ -6111,7 +6118,7 @@ void printBuffer(void * buffer, size_t len)
   printf("\n");
 }
 
-int readmsg(int sock, u8* input, s32* inputlen, u32* offset, u32* offsetSize)
+int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offsetSize)
 {
   u32 length = 0;
   char opcode;
@@ -6136,11 +6143,11 @@ int readmsg(int sock, u8* input, s32* inputlen, u32* offset, u32* offsetSize)
   }
   if (opcode == 0x02){
     // read input length
-    readNext(inputlen, &buffer, sizeof(s32));
+    readNext(inputlen, &buffer, sizeof(u32));
     // read input
     if (*inputlen + 9 >= length) {
       printBuffer(input, length);
-      printf("length<%u> and inputlen<%d> are invalid \n", length, *inputlen);
+      printf("length<%u> and inputlen<%u> are invalid \n", length, *inputlen);
       return 0;
     }
     readNext(input, &buffer, *inputlen);
@@ -6148,7 +6155,7 @@ int readmsg(int sock, u8* input, s32* inputlen, u32* offset, u32* offsetSize)
     readNext(offsetSize, &buffer, sizeof(u32));
     if (*inputlen + *offsetSize * sizeof(u32) + 9 != length){
       printBuffer(input, length);
-      printf("length<%u>, inputlen<%d> and offsetSize<%u> are invalid \n", length, *inputlen, *offsetSize);
+      printf("length<%u>, inputlen<%u> and offsetSize<%u> are invalid \n", length, *inputlen, *offsetSize);
       return 0;
     }
     // read blocked offset
@@ -6217,7 +6224,7 @@ int startSocketSrv(char** argv) {
     }
     input = calloc(MAXSOCKECTPKG, sizeof(u8));
     blocked_offset = calloc(MAXSOCKECTPKG, sizeof(u32));
-    s32 inputlen = 0;
+    u32 inputlen = 0;
     u32 offsetSize = 0;
     int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offsetSize);
     if (status < 0) {
