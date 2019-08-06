@@ -6150,7 +6150,7 @@ int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offsetSize)
     // read input length
     readNext(inputlen, &buffer, sizeof(u32));
     // read input
-    if (*inputlen + 9 >= length) {
+    if (*inputlen + 9 > length) {
       printBuffer(input, length);
       printf("length<%u> and inputlen<%u> are invalid \n", length, *inputlen);
       return 0;
