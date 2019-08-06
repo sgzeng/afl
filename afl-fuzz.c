@@ -340,39 +340,39 @@ enum {
 };
 
 // map_set
-static void map_set(struct cov_linkedList* cdm, u32 cov_id, u32 count) {
+static void map_set(struct cov_linkedList** cdm, u32 cov_id, u32 count) {
   struct cov_linkedList *s;
 
-  HASH_FIND_INT(cdm, &cov_id, s);
+  HASH_FIND_INT(*cdm, &cov_id, s);
   if (s==NULL) {
     s = (struct cov_linkedList *)malloc(sizeof *s);
     s->cov_id = cov_id;
-    HASH_ADD_INT( cdm, cov_id, s );
+    HASH_ADD_INT( *cdm, cov_id, s );
   }
   s->count = count;
 }
 
 // map_get
-static struct cov_linkedList *map_get(struct cov_linkedList* cdm, u32 cov_id) {
+static struct cov_linkedList *map_get(struct cov_linkedList** cdm, u32 cov_id) {
   struct cov_linkedList *s;
-  HASH_FIND_INT( cdm, &cov_id, s );
+  HASH_FIND_INT( *cdm, &cov_id, s );
   return s;
 }
 
 // map_free
-static void map_free(struct cov_linkedList* cdm) {
+static void map_free(struct cov_linkedList** cdm) {
   struct cov_linkedList *current_map, *tmp;
 
-  HASH_ITER(hh, cdm, current_map, tmp) {
-    HASH_DEL(cdm, current_map);  /* delete it (users advances to next) */
+  HASH_ITER(hh, *cdm, current_map, tmp) {
+    HASH_DEL(*cdm, current_map);  /* delete it (users advances to next) */
     free(current_map);             /* free it */
   }
 }
 
 // map_print
-static void map_print(struct cov_linkedList* cdm){
+static void map_print(struct cov_linkedList** cdm){
   struct cov_linkedList *m;
-  for(m=cdm; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
+  for(m=*cdm; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
     printf("cover id %u: count %u\n", m->cov_id, m->count);
   }
 }
@@ -4662,9 +4662,9 @@ static inline void common_entropy_stuff(){
   // printf("blocked offset: ");
   // printBuffer(bl_bit_set, sizeof(u32) * bl_len);
   // printf("map size: %u\n", size);
-  // map_print(cov_stage_map);
+  // map_print(&cov_stage_map);
   double entropy = 0;
-  if(size != 0){
+  if(size > 0){
     double probability=0;
     for(m=cov_stage_map; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
       u32 count = m->count;
@@ -4681,7 +4681,8 @@ static inline void common_entropy_stuff(){
     fprintf(fp, "%lf, ", entropy);
     fclose(fp);
   }
-  map_free(cov_stage_map);
+  map_free(&cov_stage_map);
+  cov_stage_map = NULL;
 }
 
 /* Write a modified test case, run program, process results. Handle
@@ -4703,20 +4704,20 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   fault = run_target(argv, exec_tmout);
   checksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
-  if(!map_get(coverage_distribution_map, checksum)){
-    map_set(coverage_distribution_map, checksum, 1);
+  if(!map_get(&coverage_distribution_map, checksum)){
+    map_set(&coverage_distribution_map, checksum, 1);
   }else {
-    u32 count = map_get(coverage_distribution_map, checksum)->count;
+    u32 count = map_get(&coverage_distribution_map, checksum)->count;
     assert(count > 0);
-    map_set(coverage_distribution_map, checksum, count+1);
+    map_set(&coverage_distribution_map, checksum, count+1);
   }
 
-  if(!map_get(cov_stage_map, checksum)){
-    map_set(cov_stage_map, checksum, 1);
+  if(!map_get(&cov_stage_map, checksum)){
+    map_set(&cov_stage_map, checksum, 1);
   }else {
-    u32 count = map_get(cov_stage_map, checksum)->count;
+    u32 count = map_get(&cov_stage_map, checksum)->count;
     assert(count > 0);
-    map_set(cov_stage_map, checksum, count+1);
+    map_set(&cov_stage_map, checksum, count+1);
   }
 
   if (stop_soon) return 1;
@@ -5055,14 +5056,13 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 /* Determinisitc sampling, return the computed entropy*/
 static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
-  if(input_len == bl_len){
-    return 0;
-  }
+  coverage_distribution_map = NULL;
+  cov_stage_map = NULL;
 
-  s32 len, fd, temp_len, i, j;
-  u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
-  u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
-  u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
+  s32 len, i, j;
+  u8  *in_buf, *out_buf, *orig_in, *eff_map = 0;
+  u64 orig_hit_cnt, new_hit_cnt;
+  u32 prev_cksum, eff_cnt = 1;
 
 //  u8  ret_val = 1, doing_det = 0;
 
@@ -5176,13 +5176,6 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
 //  }
 
   memcpy(out_buf, in_buf, len);
-
-  /*********************
-   * PERFORMANCE SCORE *
-   *********************/
-
-  orig_perf = perf_score = calculate_score(queue_cur);
-
 //  /* Skip right away if -d is given, if we have done deterministic fuzzing on
 //     this entry ourselves (was_fuzzed), or if it has gone through deterministic
 //     testing in earlier, resumed runs (passed_det). */
@@ -5468,8 +5461,11 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
 
   /* Two walking bytes. */
 
-  if (len < 2) goto skip_bitflip_entropy;
-
+  if (len < 2) {
+    // write 0 to log
+    common_entropy_stuff();
+    goto skip_bitflip_entropy;
+  }
   stage_name  = "bitflip 16/8";
   stage_short = "flip16";
   stage_cur   = 0;
@@ -5507,7 +5503,11 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
   stage_finds[STAGE_FLIP16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP16] += stage_max;
 
-  if (len < 4) goto skip_bitflip_entropy;
+  if (len < 4) {
+    // write 0 to log
+    common_entropy_stuff();
+    goto skip_bitflip_entropy;
+  }
 
   /* Four walking bytes. */
 
@@ -5627,7 +5627,11 @@ skip_bitflip_entropy:
 
   /* 16-bit arithmetics, both endians. */
 
-  if (len < 2) goto skip_arith_entropy;
+  if (len < 2){
+    // write 0 to log
+    common_entropy_stuff();
+    goto skip_arith_entropy;
+  }
 
   stage_name  = "arith 16/8";
   stage_short = "arith16";
@@ -5737,7 +5741,11 @@ skip_bitflip_entropy:
 
   /* 32-bit arithmetics, both endians. */
 
-  if (len < 4) goto skip_arith_entropy;
+  if (len < 4){
+    // write 0 to log
+    common_entropy_stuff();
+    goto skip_arith_entropy;
+  }
 
   stage_name  = "arith 32/8";
   stage_short = "arith32";
@@ -5912,7 +5920,11 @@ skip_bitflip_entropy:
 
   /* Setting 16-bit integers, both endians. */
 
-  if (no_arith || len < 2) goto skip_interest_entropy;
+  if (no_arith || len < 2){
+    // write 0 to log
+    common_entropy_stuff();
+    goto skip_interest_entropy;
+  }
 
   stage_name  = "interest 16/8";
   stage_short = "int16";
@@ -5984,7 +5996,11 @@ skip_bitflip_entropy:
   stage_finds[STAGE_INTEREST16]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST16] += stage_max;
 
-  if (len < 4) goto skip_interest_entropy;
+  if (len < 4){
+    // write 0 to log
+    common_entropy_stuff();
+    goto skip_interest_entropy;
+  }
 
   /* Setting 32-bit integers, both endians. */
 
@@ -6118,19 +6134,21 @@ skip_interest_entropy:
   // printf("blocked offset: ");
   // printBuffer(bl_bit_set, sizeof(u32) * bl_len);
   // printf("map size: %u\n", size);
-  // map_print(coverage_distribution_map);
-  assert(size > 0);
+  // map_print(&coverage_distribution_map);
   double entropy = 0;
-  double probability=0;
-  for(m=coverage_distribution_map; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
-    u32 count = m->count;
-    probability = (double)count / (double)size;
-    entropy -= probability * log2(probability);
+  if(size > 0){
+    double probability=0;
+    for(m=coverage_distribution_map; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
+      u32 count = m->count;
+      probability = (double)count / (double)size;
+      entropy -= probability * log2(probability);
+    }
   }
   // for debug
   printf("computed entropy: %lf \n", entropy);
 
-  map_free(coverage_distribution_map);
+  map_free(&coverage_distribution_map);
+  coverage_distribution_map = NULL;
   return entropy;
 
 #undef FLIP_BIT
@@ -6220,10 +6238,8 @@ int makeReplyMsg(double entropy, char* clnt_buf)
 int startSocketSrv(char** argv) {
   socklen_t clnt_len;
   int orig_sock, new_sock;
-  u32* blocked_offset;
-  u8* input;
   static struct sockaddr_in clnt_adr, serv_adr;
-  const int PORT = 7777;
+  const int PORT = 7778;
 
   //start_socket();
   if ((orig_sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
@@ -6255,21 +6271,17 @@ int startSocketSrv(char** argv) {
       FATAL("accept error");
       return -1;
     }
-    input = calloc(MAXSOCKECTPKG, sizeof(u8));
-    blocked_offset = calloc(MAXSOCKECTPKG, sizeof(u32));
+    u8 input[MAXSOCKECTPKG];
+    u32 blocked_offset[MAXSOCKECTPKG];
     u32 inputlen = 0;
     u32 offsetSize = 0;
     int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offsetSize);
     if (status < 0) {
-      free(input);
-      free(blocked_offset);
       close(new_sock);
       close(orig_sock);
       exit(0);
     }
     if (status == 0) {
-      free(input);
-      free(blocked_offset);
       close(new_sock);
       printf("Client abort, waiting for another request\n");
       continue;
@@ -6287,8 +6299,6 @@ int startSocketSrv(char** argv) {
     if(write(new_sock, clnt_buf, len) < 0) {
       FATAL("write to socket failed");
     }
-    free(input);
-    free(blocked_offset);
     close(new_sock);
     printf("Waiting for another request\n");
   }
@@ -9360,7 +9370,6 @@ int main(int argc, char** argv) {
   }
 
   if(slave_mode){
-    u8 skipped_fuzz;
 
     cull_queue();
 
