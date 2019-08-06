@@ -27,7 +27,6 @@
 #define _FILE_OFFSET_BITS 64
 #define MAXSOCKECTPKG 2048
 
-#include "uthash.h"
 #include "config.h"
 #include "types.h"
 #include "debug.h"
@@ -144,9 +143,42 @@ static s32 forksrv_pid,               /* PID of the fork server           */
 
 struct cov_linkedList {
     u32 cov_id;                    /* key */
-    u32 count;
-    UT_hash_handle hh;         /* makes this structure hashable */
+    // u32 count;
+    struct cov_linkedList *next;
 };
+
+void push_list(struct cov_linkedList** head, u32 cov_id){
+  struct cov_linkedList* new_node = (struct cov_linkedList*)malloc(sizeof(struct cov_linkedList));
+  new_node->cov_id = cov_id;
+  new_node->next = *head;
+  *head = new_node;
+}
+
+size_t get_size(struct cov_linkedList** head){
+  size_t size = 0;
+  struct cov_linkedList *it;
+  for(it = *head; it != NULL; it = it->next){
+    size++;
+  }
+  return size;
+}
+
+void free_list(struct cov_linkedList** head){
+  struct cov_linkedList *it;
+  for(it = *head; it != NULL; it = it->next){
+    free(it);
+  }
+}
+
+bool has_cov(struct cov_linkedList** head, u32 new_cov){
+  struct cov_linkedList *it;
+  for(it = *head; it != NULL; it = it->next){
+    if(it->cov_id == new_cov)
+      return true;
+  }
+  return false;
+}
+
 struct cov_linkedList *coverage_distribution_map = NULL;
 struct cov_linkedList *cov_stage_map = NULL;
 
@@ -338,44 +370,6 @@ enum {
   /* 04 */ FAULT_NOINST,
   /* 05 */ FAULT_NOBITS
 };
-
-// map_set
-static void map_set(struct cov_linkedList** cdm, u32 cov_id, u32 count) {
-  struct cov_linkedList *s;
-
-  HASH_FIND_INT(*cdm, &cov_id, s);
-  if (s==NULL) {
-    s = (struct cov_linkedList *)malloc(sizeof *s);
-    s->cov_id = cov_id;
-    HASH_ADD_INT( *cdm, cov_id, s );
-  }
-  s->count = count;
-}
-
-// map_get
-static struct cov_linkedList *map_get(struct cov_linkedList** cdm, u32 cov_id) {
-  struct cov_linkedList *s;
-  HASH_FIND_INT( *cdm, &cov_id, s );
-  return s;
-}
-
-// map_free
-static void map_free(struct cov_linkedList** cdm) {
-  struct cov_linkedList *current_map, *tmp;
-
-  HASH_ITER(hh, *cdm, current_map, tmp) {
-    HASH_DEL(*cdm, current_map);  /* delete it (users advances to next) */
-    free(current_map);             /* free it */
-  }
-}
-
-// map_print
-static void map_print(struct cov_linkedList** cdm){
-  struct cov_linkedList *m;
-  for(m=*cdm; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
-    printf("cover id %u: count %u\n", m->cov_id, m->count);
-  }
-}
 
 /* Get unix time in milliseconds */
 
@@ -4651,37 +4645,22 @@ EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u3
 }
 
 static inline void common_entropy_stuff(){
-  u32 size = 0;
-  struct cov_linkedList *m;
-  for(m=cov_stage_map; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
-    size += m->count;
-  }
+  size_t pathNum = get_size(&cov_stage_map);
   // for debug
   // printf("input received: ");
   // printBuffer(orig_in, sizeof(u8) * len);
   // printf("blocked offset: ");
   // printBuffer(bl_bit_set, sizeof(u32) * bl_len);
-  // printf("map size: %u\n", size);
-  // map_print(&cov_stage_map);
-  double entropy = 0;
-  if(size > 0){
-    double probability=0;
-    for(m=cov_stage_map; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
-      u32 count = m->count;
-      probability = (double)count / (double)size;
-      entropy -= probability * log2(probability);
-    }
-  }
   // for debug
   // printf("computed entropy: %lf \n", entropy);
   FILE *fp = fopen("my.log", "a+");
   if (fp != NULL)
   {
   //    fputs("###############\n", fp);
-    fprintf(fp, "%lf, ", entropy);
+    fprintf(fp, "%lu, ", pathNum);
     fclose(fp);
   }
-  map_free(&cov_stage_map);
+  free_list(&cov_stage_map);
   cov_stage_map = NULL;
 }
 
@@ -4704,21 +4683,10 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   fault = run_target(argv, exec_tmout);
   checksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
-  if(!map_get(&coverage_distribution_map, checksum)){
-    map_set(&coverage_distribution_map, checksum, 1);
-  }else {
-    u32 count = map_get(&coverage_distribution_map, checksum)->count;
-    assert(count > 0);
-    map_set(&coverage_distribution_map, checksum, count+1);
-  }
-
-  if(!map_get(&cov_stage_map, checksum)){
-    map_set(&cov_stage_map, checksum, 1);
-  }else {
-    u32 count = map_get(&cov_stage_map, checksum)->count;
-    assert(count > 0);
-    map_set(&cov_stage_map, checksum, count+1);
-  }
+  if(!has_cov(&coverage_distribution_map, checksum))
+    push_list(&coverage_distribution_map, checksum);
+  if(!has_cov(&cov_stage_map, checksum))
+    push_list(&cov_stage_map, checksum);
 
   if (stop_soon) return 1;
 
@@ -6123,33 +6091,19 @@ skip_interest_entropy:
   ck_free(out_buf);
   ck_free(eff_map);
 
-  u32 size = 0;
-  struct cov_linkedList *m;
-  for(m=coverage_distribution_map; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
-    size += m->count;
-  }
+  double pathNum = (double)get_size(&coverage_distribution_map);
+
   // for debug
   // printf("input received: ");
   // printBuffer(orig_in, sizeof(u8) * len);
   // printf("blocked offset: ");
   // printBuffer(bl_bit_set, sizeof(u32) * bl_len);
   // printf("map size: %u\n", size);
-  // map_print(&coverage_distribution_map);
-  double entropy = 0;
-  if(size > 0){
-    double probability=0;
-    for(m=coverage_distribution_map; m != NULL; m=(struct cov_linkedList*)(m->hh.next)) {
-      u32 count = m->count;
-      probability = (double)count / (double)size;
-      entropy -= probability * log2(probability);
-    }
-  }
   // for debug
-  printf("computed entropy: %lf \n", entropy);
+  printf("computed reward: %lf \n", pathNum);
 
-  map_free(&coverage_distribution_map);
-  coverage_distribution_map = NULL;
-  return entropy;
+  free_list(&coverage_distribution_map);
+  return pathNum;
 
 #undef FLIP_BIT
 
