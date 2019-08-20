@@ -993,6 +993,67 @@ static inline u8 has_new_bits(u8* virgin_map) {
 
 }
 
+static inline u8 has_new_tuples(u8* virgin_map) {
+
+#ifdef __x86_64__
+
+  u64* current = (u64*)trace_bits;
+  u64* virgin  = (u64*)virgin_map;
+
+  u32  i = (MAP_SIZE >> 3);
+
+#else
+
+  u32* current = (u32*)trace_bits;
+  u32* virgin  = (u32*)virgin_map;
+
+  u32  i = (MAP_SIZE >> 2);
+
+#endif /* ^__x86_64__ */
+
+  u8   ret = 0;
+
+  while (i--) {
+
+    /* Optimize for (*current & *virgin) == 0 - i.e., no bits in current bitmap
+       that have not been already cleared from the virgin map - since this will
+       almost always be the case. */
+
+    if (unlikely(*current) && unlikely(*current & *virgin)) {
+
+      if (likely(ret < 2)) {
+
+        u8* cur = (u8*)current;
+        u8* vir = (u8*)virgin;
+
+        /* Looks like we have not found any new bytes yet; see if any non-zero
+           bytes in current[] are pristine in virgin[]. */
+
+#ifdef __x86_64__
+
+        if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
+            (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff) ||
+            (cur[4] && vir[4] == 0xff) || (cur[5] && vir[5] == 0xff) ||
+            (cur[6] && vir[6] == 0xff) || (cur[7] && vir[7] == 0xff)) ret = 2;
+        else ret = 1;
+
+#else
+
+        if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
+            (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff)) ret = 2;
+        else ret = 1;
+
+#endif /* ^__x86_64__ */
+
+      }
+    }
+    current++;
+    virgin++;
+  }
+
+  return ret;
+
+}
 
 /* Count the number of bits set in the provided bitmap. Used for the status
    screen several times every second, does not have to be fast. */
@@ -4670,8 +4731,7 @@ static inline void common_entropy_stuff(){
 
 EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   u8 fault;
-  u32 checksum;
-
+  u32 checksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
   if (post_handler) {
 
     out_buf = post_handler(out_buf, &len);
@@ -4682,11 +4742,12 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   write_to_testcase(out_buf, len);
 
   fault = run_target(argv, exec_tmout);
-  checksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
-  if(!has_cov(&coverage_distribution_map, checksum))
-    push_list(&coverage_distribution_map, checksum);
-  if(!has_cov(&cov_stage_map, checksum))
-    push_list(&cov_stage_map, checksum);
+  if(has_new_tuples(virgin_bits) == 2){
+    if(!has_cov(&coverage_distribution_map, checksum))
+      push_list(&coverage_distribution_map, checksum);
+    if(!has_cov(&cov_stage_map, checksum))
+      push_list(&cov_stage_map, checksum);
+  }
 
   if (stop_soon) return 1;
 
@@ -6254,6 +6315,12 @@ int startSocketSrv(char** argv) {
       FATAL("write to socket failed");
     }
     close(new_sock);
+    // reset virgin map
+    if (!in_bitmap){
+      memset(virgin_bits, 255, MAP_SIZE);
+    }else{
+      read_bitmap(in_bitmap);
+    }
     printf("Waiting for another request\n");
   }
 }
