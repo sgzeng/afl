@@ -180,7 +180,7 @@ bool has_cov(struct cov_linkedList** head, u32 new_cov){
 }
 
 struct cov_linkedList *coverage_distribution_map = NULL;
-struct cov_linkedList *cov_stage_map = NULL;
+// struct cov_linkedList *cov_stage_map = NULL;
 
 EXP_ST u8 slave_mode = 0;
 
@@ -4705,25 +4705,25 @@ EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u3
   return true;
 }
 
-static inline void common_entropy_stuff(){
-  size_t pathNum = get_size(&cov_stage_map);
-  // for debug
-  // printf("input received: ");
-  // printBuffer(orig_in, sizeof(u8) * len);
-  // printf("blocked offset: ");
-  // printBuffer(bl_bit_set, sizeof(u32) * bl_len);
-  // for debug
-  // printf("computed entropy: %lf \n", entropy);
-  FILE *fp = fopen("my.log", "a+");
-  if (fp != NULL)
-  {
-  //    fputs("###############\n", fp);
-    fprintf(fp, "%lu, ", pathNum);
-    fclose(fp);
-  }
-  free_list(&cov_stage_map);
-  cov_stage_map = NULL;
-}
+// static inline void common_entropy_stuff(){
+//   size_t pathNum = get_size(&cov_stage_map);
+//   // for debug
+//   // printf("input received: ");
+//   // printBuffer(orig_in, sizeof(u8) * len);
+//   // printf("blocked offset: ");
+//   // printBuffer(bl_bit_set, sizeof(u32) * bl_len);
+//   // for debug
+//   // printf("computed entropy: %lf \n", entropy);
+//   FILE *fp = fopen("my.log", "a+");
+//   if (fp != NULL)
+//   {
+//   //    fputs("###############\n", fp);
+//     fprintf(fp, "%lu, ", pathNum);
+//     fclose(fp);
+//   }
+//   free_list(&cov_stage_map);
+//   cov_stage_map = NULL;
+// }
 
 /* Write a modified test case, run program, process results. Handle
    error conditions, returning 1 if it's time to bail out. This is
@@ -4745,8 +4745,8 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   if(has_new_tuples(virgin_bits) == 2){
     if(!has_cov(&coverage_distribution_map, checksum))
       push_list(&coverage_distribution_map, checksum);
-    if(!has_cov(&cov_stage_map, checksum))
-      push_list(&cov_stage_map, checksum);
+    // if(!has_cov(&cov_stage_map, checksum))
+    //   push_list(&cov_stage_map, checksum);
   }
 
   if (stop_soon) return 1;
@@ -5086,7 +5086,7 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 /* Determinisitc sampling, return the computed entropy*/
 static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
   coverage_distribution_map = NULL;
-  cov_stage_map = NULL;
+  // cov_stage_map = NULL;
 
   s32 len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *eff_map = 0;
