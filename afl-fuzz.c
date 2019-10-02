@@ -25,7 +25,7 @@
 
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
-#define MAXSOCKECTPKG 2048
+#define MAXSOCKECTPKG 4096
 
 #include "config.h"
 #include "types.h"
@@ -5309,7 +5309,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
     }
 
   }
-  common_entropy_stuff();
+  // common_entropy_stuff();
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH8]  += new_hit_cnt - orig_hit_cnt;
@@ -5319,7 +5319,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
 
   if (len < 2){
     // write 0 to log
-    common_entropy_stuff();
+    // common_entropy_stuff();
     goto skip_arith_entropy;
   }
 
@@ -5423,7 +5423,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
     }
 
   }
-  common_entropy_stuff();
+  // common_entropy_stuff();
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH16]  += new_hit_cnt - orig_hit_cnt;
@@ -5433,7 +5433,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
 
   if (len < 4){
     // write 0 to log
-    common_entropy_stuff();
+    // common_entropy_stuff();
     goto skip_arith_entropy;
   }
 
@@ -5543,7 +5543,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
     }
 
   }
-  common_entropy_stuff();
+  // common_entropy_stuff();
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_ARITH32]  += new_hit_cnt - orig_hit_cnt;
@@ -5602,7 +5602,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
     }
 
   }
-  common_entropy_stuff();
+  // common_entropy_stuff();
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST8]  += new_hit_cnt - orig_hit_cnt;
@@ -5612,7 +5612,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
 
   if (no_arith || len < 2){
     // write 0 to log
-    common_entropy_stuff();
+    // common_entropy_stuff();
     goto skip_interest_entropy;
   }
 
@@ -5680,7 +5680,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
     *(u16*)(out_buf + i) = orig;
 
   }
-  common_entropy_stuff();
+  // common_entropy_stuff();
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST16]  += new_hit_cnt - orig_hit_cnt;
@@ -5688,7 +5688,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
 
   if (len < 4){
     // write 0 to log
-    common_entropy_stuff();
+    // common_entropy_stuff();
     goto skip_interest_entropy;
   }
 
@@ -5762,7 +5762,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
     *(u32*)(out_buf + i) = orig;
 
   }
-  common_entropy_stuff();
+  // common_entropy_stuff();
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_INTEREST32]  += new_hit_cnt - orig_hit_cnt;
@@ -5962,13 +5962,7 @@ int startSocketSrv(char** argv) {
       printf("Client abort, waiting for another request\n");
       continue;
     }
-//  for debug
-//    printf("\n");
-//    printBuffer(input, inputlen);
-//    for (int i=0;i<offsetSize;i++){
-//      printf("%d ", blocked_offset[i]);
-//    }
-//    printf("\n");
+
     double entropy = computeEntropy(input, inputlen, blocked_offset, offsetSize, argv);
     char clnt_buf[MAXSOCKECTPKG];
     int len = makeReplyMsg(entropy, clnt_buf);
