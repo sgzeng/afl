@@ -154,8 +154,8 @@ void push_list(struct cov_linkedList** head, u32 cov_id){
   *head = new_node;
 }
 
-size_t get_size(struct cov_linkedList** head){
-  size_t size = 0;
+u32 get_size(struct cov_linkedList** head){
+  u32 size = 0;
   struct cov_linkedList *it;
   for(it = *head; it != NULL; it = it->next){
     size++;
@@ -4695,7 +4695,7 @@ EXP_ST bool check_bl_offset(u32 *bl_set, u32 bl_len, u8 *in_buf, u8 *out_buf, u3
   // check if bl_set is valid against out_buf
   for(u32 i=0; i<bl_len; i++){
     if(bl_set[i] > stage_cur_byte){
-      return true;
+      break;
     }
     // xor only the byte in bl_set between in_buf and out_buf
     if( stage_cur_byte == bl_set[i] && in_buf[stage_cur_byte] ^ out_buf[stage_cur_byte]){
@@ -5084,7 +5084,7 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 
 /* Determinisitc sampling, return the computed entropy*/
-static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
+static u32 computeReward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
   coverage_distribution_map = NULL;
   // cov_stage_map = NULL;
 
@@ -5142,8 +5142,7 @@ static double computeEntropy(u8 *input, u32 input_len, u32 *bl_bit_set, u32 bl_l
   /* Map the test case into memory. */
 
   len = input_len;
-  orig_in = in_buf = malloc(len*sizeof(u8));
-  memcpy(orig_in, input, len);
+  orig_in = in_buf = input;
   /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
      single byte anyway, so it wouldn't give us any performance or memory usage
      benefits. */
@@ -5807,13 +5806,10 @@ skip_interest_entropy:
     if (queue_cur->favored) pending_favored--;
   }
 
-  munmap(orig_in, queue_cur->len);
-
-  if (in_buf != orig_in) ck_free(in_buf);
   ck_free(out_buf);
   ck_free(eff_map);
 
-  double pathNum = (double)get_size(&coverage_distribution_map);
+  u32 pathNum = get_size(&coverage_distribution_map);
 
   // for debug
   // printf("input received: ");
@@ -5822,7 +5818,7 @@ skip_interest_entropy:
   // printBuffer(bl_bit_set, sizeof(u32) * bl_len);
   // printf("map size: %u\n", size);
   // for debug
-  printf("computed reward: %lf \n", pathNum);
+  printf("computed reward: %u \n", pathNum);
 
   free_list(&coverage_distribution_map);
   return pathNum;
@@ -5963,9 +5959,9 @@ int startSocketSrv(char** argv) {
       continue;
     }
 
-    double entropy = computeEntropy(input, inputlen, blocked_offset, offsetSize, argv);
+    u32 reward = computeReward(input, (s32)inputlen, blocked_offset, offsetSize, argv);
     char clnt_buf[MAXSOCKECTPKG];
-    int len = makeReplyMsg(entropy, clnt_buf);
+    int len = makeReplyMsg(reward, clnt_buf);
     if(write(new_sock, clnt_buf, len) < 0) {
       FATAL("write to socket failed");
     }
