@@ -5084,12 +5084,12 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 
 /* Determinisitc sampling, return the computed entropy*/
-static u32 computeReward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
+static u32 compute_reward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, char** argv) {
   coverage_distribution_map = NULL;
   // cov_stage_map = NULL;
 
   s32 len, i, j;
-  u8  *in_buf, *out_buf, *orig_in, *eff_map = 0;
+  u8  *out_buf, *orig_in, *eff_map = 0;
   u64 orig_hit_cnt, new_hit_cnt;
   u32 eff_cnt = 1;
 
@@ -5142,7 +5142,7 @@ static u32 computeReward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, 
   /* Map the test case into memory. */
 
   len = input_len;
-  orig_in = in_buf = input;
+  orig_in = input;
   /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
      single byte anyway, so it wouldn't give us any performance or memory usage
      benefits. */
@@ -5157,24 +5157,24 @@ static u32 computeReward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, 
    * CALIBRATION (only if failed earlier on) *
    *******************************************/
 
-  if (queue_cur->cal_failed) {
+  // if (queue_cur->cal_failed) {
 
-    u8 res = FAULT_TMOUT;
+  //   u8 res = FAULT_TMOUT;
 
-    if (queue_cur->cal_failed < CAL_CHANCES) {
+  //   if (queue_cur->cal_failed < CAL_CHANCES) {
 
-      res = calibrate_case(argv, queue_cur, in_buf, queue_cycle - 1, 0);
+  //     res = calibrate_case(argv, queue_cur, in_buf, queue_cycle - 1, 0);
 
-      if (res == FAULT_ERROR)
-        FATAL("Unable to execute target application");
+  //     if (res == FAULT_ERROR)
+  //       FATAL("Unable to execute target application");
 
-    }
+  //   }
 
-    if (stop_soon || res != crash_mode) {
-      cur_skipped_paths++;
-    }
+  //   if (stop_soon || res != crash_mode) {
+  //     cur_skipped_paths++;
+  //   }
 
-  }
+  // }
 
   /************
    * TRIMMING *
@@ -5200,7 +5200,7 @@ static u32 computeReward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len, 
 //
 //  }
 
-  memcpy(out_buf, in_buf, len);
+  memcpy(out_buf, orig_in, len);
 //  /* Skip right away if -d is given, if we have done deterministic fuzzing on
 //     this entry ourselves (was_fuzzed), or if it has gone through deterministic
 //     testing in earlier, resumed runs (passed_det). */
@@ -5841,7 +5841,7 @@ void printBuffer(void * buffer, size_t len)
   printf("\n");
 }
 
-int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offsetSize)
+int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offset_size)
 {
   u32 length = 0;
   char opcode;
@@ -5875,14 +5875,14 @@ int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offsetSize)
     }
     readNext(input, &buffer, *inputlen);
     // read blocked offset length
-    readNext(offsetSize, &buffer, sizeof(u32));
-    if (*inputlen + *offsetSize * sizeof(u32) + 9 != length){
+    readNext(offset_size, &buffer, sizeof(u32));
+    if (*inputlen + *offset_size * sizeof(u32) + 9 != length){
       printBuffer(input, length);
-      printf("length<%u>, inputlen<%u> and offsetSize<%u> are invalid \n", length, *inputlen, *offsetSize);
+      printf("length<%u>, inputlen<%u> and offset_size<%u> are invalid \n", length, *inputlen, *offset_size);
       return 0;
     }
     // read blocked offset
-    readNext(offset, &buffer, *offsetSize * sizeof(u32));
+    readNext(offset, &buffer, *offset_size * sizeof(u32));
     return 1;
   }
   printf("opcode<0x%x> is invalid \n", opcode);
@@ -5946,8 +5946,8 @@ int startSocketSrv(char** argv) {
     u8 input[MAXSOCKECTPKG];
     u32 blocked_offset[MAXSOCKECTPKG];
     u32 inputlen = 0;
-    u32 offsetSize = 0;
-    int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offsetSize);
+    u32 offset_size = 0;
+    int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offset_size);
     if (status < 0) {
       close(new_sock);
       close(orig_sock);
@@ -5958,8 +5958,22 @@ int startSocketSrv(char** argv) {
       printf("Client abort, waiting for another request\n");
       continue;
     }
+//  for debug
+    // FILE *fp = fopen("afl.log", "a+");
+    // if (fp != NULL){
+    //   // printBuffer(input, inputlen);
+    //     for(int i=0; i<inputlen; i++){
+    //       fprintf(fp, "0x%02x, ", *(u8 *)(input+i));
+    //     }
+    //     fprintf(fp, "\n");
+    //     for (int i=0;i<offset_size;i++){
+    //       fprintf(fp, "%d, ", blocked_offset[i]);
+    //     }
+    //     fprintf(fp, "\n");
+    //     fclose(fp);
+    // }
 
-    u32 reward = computeReward(input, (s32)inputlen, blocked_offset, offsetSize, argv);
+    u32 reward = compute_reward(input, (s32)inputlen, blocked_offset, offset_size, argv);
     char clnt_buf[MAXSOCKECTPKG];
     int len = makeReplyMsg(reward, clnt_buf);
     if(write(new_sock, clnt_buf, len) < 0) {
