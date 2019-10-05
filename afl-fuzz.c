@@ -148,7 +148,7 @@ struct cov_linkedList {
 };
 
 void push_list(struct cov_linkedList** head, u32 cov_id){
-  struct cov_linkedList* new_node = (struct cov_linkedList*)malloc(sizeof(struct cov_linkedList));
+  struct cov_linkedList* new_node = (struct cov_linkedList*)ck_alloc(sizeof(struct cov_linkedList));
   new_node->cov_id = cov_id;
   new_node->next = *head;
   *head = new_node;
@@ -166,7 +166,7 @@ u32 get_size(struct cov_linkedList** head){
 void free_list(struct cov_linkedList** head){
   struct cov_linkedList *it;
   for(it = *head; it != NULL; it = it->next){
-    free(it);
+    ck_free(it);
   }
 }
 
@@ -5147,7 +5147,7 @@ static u32 compute_reward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len,
      single byte anyway, so it wouldn't give us any performance or memory usage
      benefits. */
 
-  out_buf = ck_alloc_nozero(len);
+  out_buf = ck_alloc(len);
 
   subseq_tmouts = 0;
 
@@ -5199,7 +5199,6 @@ static u32 compute_reward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len,
 //    if (len != queue_cur->len) len = queue_cur->len;
 //
 //  }
-
   memcpy(out_buf, orig_in, len);
 //  /* Skip right away if -d is given, if we have done deterministic fuzzing on
 //     this entry ourselves (was_fuzzed), or if it has gone through deterministic
@@ -5841,7 +5840,7 @@ void printBuffer(void * buffer, size_t len)
   printf("\n");
 }
 
-int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offset_size)
+int readmsg(int sock, u8** input, u32* inputlen, u32** offset, u32* offset_size)
 {
   u32 length = 0;
   char opcode;
@@ -5861,7 +5860,6 @@ int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offset_size)
   }
   readNext(&opcode, &buffer, sizeof(char));
   if (opcode == 0x00){
-    printf("client ask me to suicide \n");
     return -1;
   }
   if (opcode == 0x02){
@@ -5869,20 +5867,22 @@ int readmsg(int sock, u8* input, u32* inputlen, u32* offset, u32* offset_size)
     readNext(inputlen, &buffer, sizeof(u32));
     // read input
     if (*inputlen + 9 > length) {
-      printBuffer(input, length);
+      printBuffer(*input, length);
       printf("length<%u> and inputlen<%u> are invalid \n", length, *inputlen);
       return 0;
     }
-    readNext(input, &buffer, *inputlen);
+    *input = ck_alloc(*inputlen);
+    readNext(*input, &buffer, *inputlen);
     // read blocked offset length
     readNext(offset_size, &buffer, sizeof(u32));
     if (*inputlen + *offset_size * sizeof(u32) + 9 != length){
-      printBuffer(input, length);
+      printBuffer(*input, length);
       printf("length<%u>, inputlen<%u> and offset_size<%u> are invalid \n", length, *inputlen, *offset_size);
       return 0;
     }
+    *offset = ck_alloc(*offset_size * sizeof(u32));
     // read blocked offset
-    readNext(offset, &buffer, *offset_size * sizeof(u32));
+    readNext(*offset, &buffer, *offset_size * sizeof(u32));
     return 1;
   }
   printf("opcode<0x%x> is invalid \n", opcode);
@@ -5896,14 +5896,14 @@ void appendBuffer(void* dst, void* src, int size, int* index)
   *index = current + size;
 }
 
-int makeReplyMsg(double entropy, char* clnt_buf)
+int makeReplyMsg(double reward, char* clnt_buf)
 {
   char opcode = 0x01;
-  int length = sizeof(opcode) + sizeof(entropy);
+  int length = sizeof(opcode) + sizeof(reward);
   int index = 0;
   appendBuffer(clnt_buf, &length, sizeof(length), &index);
   appendBuffer(clnt_buf, &opcode, sizeof(opcode), &index);
-  appendBuffer(clnt_buf, &entropy, sizeof(double), &index);
+  appendBuffer(clnt_buf, &reward, sizeof(double), &index);
   return length + sizeof(int);
 }
 
@@ -5934,6 +5934,8 @@ int startSocketSrv(char** argv) {
   //start_listen();
   listen(orig_sock, 5);
 
+  u8* input = NULL;
+  u32* blocked_offset = NULL;
   while(1) {
     //start_accept();
     clnt_len = sizeof(clnt_adr);
@@ -5943,19 +5945,33 @@ int startSocketSrv(char** argv) {
       FATAL("accept error");
       return -1;
     }
-    u8 input[MAXSOCKECTPKG];
-    u32 blocked_offset[MAXSOCKECTPKG];
     u32 inputlen = 0;
     u32 offset_size = 0;
-    int status = readmsg(new_sock, input, &inputlen, blocked_offset, &offset_size);
+    int status = readmsg(new_sock, &input, &inputlen, &blocked_offset, &offset_size);
     if (status < 0) {
       close(new_sock);
       close(orig_sock);
-      exit(0);
+      if(input != NULL){
+        ck_free(input);
+        input = NULL;
+      }
+      if(blocked_offset != NULL){
+        ck_free(blocked_offset);
+        blocked_offset = NULL;
+      }
+      FATAL("client ask me to suicide");
     }
     if (status == 0) {
       close(new_sock);
       printf("Client abort, waiting for another request\n");
+      if(input != NULL){
+        ck_free(input);
+        input = NULL;
+      }
+      if(blocked_offset != NULL){
+        ck_free(blocked_offset);
+        blocked_offset = NULL;
+      }
       continue;
     }
 //  for debug
@@ -5974,19 +5990,36 @@ int startSocketSrv(char** argv) {
     // }
 
     u32 reward = compute_reward(input, (s32)inputlen, blocked_offset, offset_size, argv);
-    char clnt_buf[MAXSOCKECTPKG];
-    int len = makeReplyMsg(reward, clnt_buf);
+    char clnt_buf[128];
+    int len = makeReplyMsg((double)reward, clnt_buf);
     if(write(new_sock, clnt_buf, len) < 0) {
+      close(new_sock);
+      close(orig_sock);
+      if(input != NULL){
+        ck_free(input);
+        input = NULL;
+      }
+      if(blocked_offset != NULL){
+        ck_free(blocked_offset);
+        blocked_offset = NULL;
+      }
       FATAL("write to socket failed");
     }
-    close(new_sock);
     // reset virgin map
     if (!in_bitmap){
       memset(virgin_bits, 255, MAP_SIZE);
     }else{
       read_bitmap(in_bitmap);
     }
-    printf("Waiting for another request\n");
+    close(new_sock);
+    if(input != NULL){
+      ck_free(input);
+      input = NULL;
+    }
+    if(blocked_offset != NULL){
+      ck_free(blocked_offset);
+      blocked_offset = NULL;
+    }
   }
 }
 
