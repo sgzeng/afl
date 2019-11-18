@@ -25,7 +25,6 @@
 
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
-#define MAXSOCKECTPKG 4096
 
 #include "config.h"
 #include "types.h"
@@ -62,6 +61,7 @@
 #include <assert.h>
 #include <math.h>
 
+#define SERVER_PATH "/tmp/domainSock"
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -5091,7 +5091,10 @@ static u32 compute_reward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len,
   s32 len, i, j;
   u8  *out_buf, *orig_in, *eff_map = 0;
   u64 orig_hit_cnt, new_hit_cnt;
+  u32 prev_cksum = 1;
   u32 eff_cnt = 1;
+  u8  a_collect[MAX_AUTO_EXTRA];
+  u32 a_len = 0;
 
 //  u8  ret_val = 1, doing_det = 0;
 
@@ -5215,6 +5218,174 @@ static u32 compute_reward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len,
 
 //  doing_det = 1;
 
+  /*********************************************
+   * SIMPLE BITFLIP (+dictionary construction) *
+   *********************************************/
+
+#define FLIP_BIT(_ar, _b) do { \
+    u8* _arf = (u8*)(_ar); \
+    u32 _bf = (_b); \
+    _arf[(_bf) >> 3] ^= (128 >> ((_bf) & 7)); \
+  } while (0)
+
+  /* Single walking bit. */
+
+  stage_short = "flip1";
+  stage_max   = len << 3;
+  stage_name  = "bitflip 1/1";
+
+  stage_val_type = STAGE_VAL_NONE;
+
+  orig_hit_cnt = queued_paths + unique_crashes;
+
+  prev_cksum = queue_cur->exec_cksum;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur >> 3;
+
+    FLIP_BIT(out_buf, stage_cur);
+
+    // check and restore bits in the offset blacklist
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte)){
+      common_fuzz_stuff(argv, out_buf, len);
+    }
+
+    FLIP_BIT(out_buf, stage_cur);
+
+    /* While flipping the least significant bit in every byte, pull of an extra
+       trick to detect possible syntax tokens. In essence, the idea is that if
+       you have a binary blob like this:
+       xxxxxxxxIHDRxxxxxxxx
+       ...and changing the leading and trailing bytes causes variable or no
+       changes in program flow, but touching any character in the "IHDR" string
+       always produces the same, distinctive path, it's highly likely that
+       "IHDR" is an atomically-checked magic value of special significance to
+       the fuzzed format.
+       We do this here, rather than as a separate stage, because it's a nice
+       way to keep the operation approximately "free" (i.e., no extra execs).
+       Empirically, performing the check when flipping the least significant bit
+       is advantageous, compared to doing it at the time of more disruptive
+       changes, where the program flow may be affected in more violent ways.
+       The caveat is that we won't generate dictionaries in the -d mode or -S
+       mode - but that's probably a fair trade-off.
+       This won't work particularly well with paths that exhibit variable
+       behavior, but fails gracefully, so we'll carry out the checks anyway.
+      */
+
+    if (!dumb_mode && (stage_cur & 7) == 7) {
+
+      u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+      if (stage_cur == stage_max - 1 && cksum == prev_cksum) {
+
+        /* If at end of file and we are still collecting a string, grab the
+           final character and force output. */
+
+        if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];
+        a_len++;
+
+        if (a_len >= MIN_AUTO_EXTRA && a_len <= MAX_AUTO_EXTRA)
+          maybe_add_auto(a_collect, a_len);
+
+      } else if (cksum != prev_cksum) {
+
+        /* Otherwise, if the checksum has changed, see if we have something
+           worthwhile queued up, and collect that if the answer is yes. */
+
+        if (a_len >= MIN_AUTO_EXTRA && a_len <= MAX_AUTO_EXTRA)
+          maybe_add_auto(a_collect, a_len);
+
+        a_len = 0;
+        prev_cksum = cksum;
+
+      }
+
+      /* Continue collecting string, but only if the bit flip actually made
+         any difference - we don't want no-op tokens. */
+
+      if (cksum != queue_cur->exec_cksum) {
+
+        if (a_len < MAX_AUTO_EXTRA) a_collect[a_len] = out_buf[stage_cur >> 3];
+        a_len++;
+
+      }
+
+    }
+
+  }
+  // common_entropy_stuff();
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP1]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP1] += stage_max;
+
+  /* Two walking bits. */
+
+  stage_name  = "bitflip 2/1";
+  stage_short = "flip2";
+  stage_max   = (len << 3) - 1;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur >> 3;
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur >> 3) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur + 1) >> 3)){
+      common_fuzz_stuff(argv, out_buf, len);
+    }
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+
+  }
+  // common_entropy_stuff();
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP2]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP2] += stage_max;
+
+  /* Four walking bits. */
+
+  stage_name  = "bitflip 4/1";
+  stage_short = "flip4";
+  stage_max   = (len << 3) - 3;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur >> 3;
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+    FLIP_BIT(out_buf, stage_cur + 2);
+    FLIP_BIT(out_buf, stage_cur + 3);
+
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur) >> 3) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur + 1) >> 3) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur + 2) >> 3) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, (stage_cur + 3) >> 3)){
+      common_fuzz_stuff(argv, out_buf, len);
+    }
+
+    FLIP_BIT(out_buf, stage_cur);
+    FLIP_BIT(out_buf, stage_cur + 1);
+    FLIP_BIT(out_buf, stage_cur + 2);
+    FLIP_BIT(out_buf, stage_cur + 3);
+
+  }
+  // common_entropy_stuff();
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP4]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP4] += stage_max;
+
   /* Effector map setup. These macros calculate:
 
      EFF_APOS      - position of a particular file offset in the map.
@@ -5238,7 +5409,171 @@ static u32 compute_reward(u8 *input, s32 input_len, u32 *bl_bit_set, u32 bl_len,
     eff_map[EFF_APOS(len - 1)] = 1;
     eff_cnt++;
   }
+
+
+  /* Walking byte. */
+
+  stage_name  = "bitflip 8/8";
+  stage_short = "flip8";
+  stage_max   = len;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    stage_cur_byte = stage_cur;
+
+    out_buf[stage_cur] ^= 0xFF;
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte)){
+      common_fuzz_stuff(argv, out_buf, len);
+    }
+
+    /* We also use this stage to pull off a simple trick: we identify
+       bytes that seem to have no effect on the current execution path
+       even when fully flipped - and we skip them during more expensive
+       deterministic stages, such as arithmetics or known ints. */
+
+    if (!eff_map[EFF_APOS(stage_cur)]) {
+
+      u32 cksum;
+
+      /* If in dumb mode or if the file is very short, just flag everything
+         without wasting time on checksums. */
+
+      if (!dumb_mode && len >= EFF_MIN_LEN)
+        cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+      else
+        cksum = ~queue_cur->exec_cksum;
+
+      if (cksum != queue_cur->exec_cksum) {
+        eff_map[EFF_APOS(stage_cur)] = 1;
+        eff_cnt++;
+      }
+
+    }
+
+    out_buf[stage_cur] ^= 0xFF;
+
+  }
+  // common_entropy_stuff();
+  /* If the effector map is more than EFF_MAX_PERC dense, just flag the
+     whole thing as worth fuzzing, since we wouldn't be saving much time
+     anyway. */
+
+  if (eff_cnt != EFF_ALEN(len) &&
+      eff_cnt * 100 / EFF_ALEN(len) > EFF_MAX_PERC) {
+
+    memset(eff_map, 1, EFF_ALEN(len));
+
+    blocks_eff_select += EFF_ALEN(len);
+
+  } else {
+
+    blocks_eff_select += eff_cnt;
+
+  }
+
+  blocks_eff_total += EFF_ALEN(len);
+
   new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP8]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP8] += stage_max;
+
+  /* Two walking bytes. */
+
+  if (len < 2) {
+    // write 0 to log
+    // common_entropy_stuff();
+    goto skip_bitflip_entropy;
+  }
+  stage_name  = "bitflip 16/8";
+  stage_short = "flip16";
+  stage_cur   = 0;
+  stage_max   = len - 1;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len - 1; i++) {
+
+    /* Let's consult the effector map... */
+
+    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)]) {
+      stage_max--;
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    *(u16*)(out_buf + i) ^= 0xFFFF;
+
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1)){
+      common_fuzz_stuff(argv, out_buf, len);
+    }
+
+    stage_cur++;
+
+    *(u16*)(out_buf + i) ^= 0xFFFF;
+
+
+  }
+  // common_entropy_stuff();
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP16]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP16] += stage_max;
+
+  if (len < 4) {
+    // write 0 to log
+    // common_entropy_stuff();
+    goto skip_bitflip_entropy;
+  }
+
+  /* Four walking bytes. */
+
+  stage_name  = "bitflip 32/8";
+  stage_short = "flip32";
+  stage_cur   = 0;
+  stage_max   = len - 3;
+
+  orig_hit_cnt = new_hit_cnt;
+
+  for (i = 0; i < len - 3; i++) {
+
+    /* Let's consult the effector map... */
+    if (!eff_map[EFF_APOS(i)] && !eff_map[EFF_APOS(i + 1)] &&
+        !eff_map[EFF_APOS(i + 2)] && !eff_map[EFF_APOS(i + 3)]) {
+      stage_max--;
+      continue;
+    }
+
+    stage_cur_byte = i;
+
+    *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
+
+    if(check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 1) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 2) &&
+       check_bl_offset(bl_bit_set, bl_len, orig_in, out_buf, stage_cur_byte + 3)){
+      common_fuzz_stuff(argv, out_buf, len);
+    }
+
+    stage_cur++;
+
+    *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
+
+  }
+  // common_entropy_stuff();
+
+
+  new_hit_cnt = queued_paths + unique_crashes;
+
+  stage_finds[STAGE_FLIP32]  += new_hit_cnt - orig_hit_cnt;
+  stage_cycles[STAGE_FLIP32] += stage_max;
+
+skip_bitflip_entropy:
+
   if (no_arith) goto skip_arith_entropy;
 
   /**********************
@@ -5826,7 +6161,7 @@ skip_interest_entropy:
 
 }
 
-void readNext(void* buffer, char** data, size_t datalen)
+void readNext(void* buffer, unsigned char** data, size_t datalen)
 {
   memcpy(buffer, *data, datalen);
   *data = *data + datalen;
@@ -5844,17 +6179,17 @@ int readmsg(int sock, u8** input, u32* inputlen, u32** offset, u32* offset_size)
 {
   u32 length = 0;
   char opcode;
-  if(!read(sock, &length, sizeof(u32))){
+  if (read(sock, &length, sizeof(u32)) < 0){
     printf("connection reset by the client \n");
     return 0;
   }
-  if (length > MAXSOCKECTPKG || length <= 9) {
+  if (length <= 9) {
     printf("length<0x%x> is invalid \n", length);
     return 0;
   }
-  char data[length];
-  char* buffer = data;
-  if(!read(sock, buffer, length)){
+  unsigned char data[length];
+  unsigned char* buffer = data;
+  if (read(sock, buffer, length) < 0){
     printf("connection reset by the client \n");
     return 0;
   }
@@ -5896,7 +6231,7 @@ void appendBuffer(void* dst, void* src, int size, int* index)
   *index = current + size;
 }
 
-int makeReplyMsg(double reward, char* clnt_buf)
+int makeReplyMsg(double reward, unsigned char* clnt_buf)
 {
   char opcode = 0x01;
   int length = sizeof(opcode) + sizeof(reward);
@@ -5910,23 +6245,20 @@ int makeReplyMsg(double reward, char* clnt_buf)
 int startSocketSrv(char** argv) {
   socklen_t clnt_len;
   int orig_sock, new_sock;
-  static struct sockaddr_in clnt_adr, serv_adr;
-  const int PORT = 7778;
+  static struct sockaddr_un clnt_adr, serv_adr;
 
   //start_socket();
-  if ((orig_sock = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
+  if ((orig_sock = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
     FATAL("generate error");
     return -1;
   }
 
   //start_bind();
-  memset(&serv_adr, 0, sizeof(serv_adr));
-  serv_adr.sin_family = AF_INET;
-  serv_adr.sin_addr.s_addr = htonl(INADDR_ANY);
-  serv_adr.sin_port = htons(PORT);
-
+  memset(&serv_adr, 0, sizeof(struct sockaddr_un));
+  serv_adr.sun_family = AF_UNIX;
+  strncpy(serv_adr.sun_path, SERVER_PATH, sizeof(serv_adr.sun_path)-1);
   if (bind(orig_sock, (struct sockaddr *)&serv_adr,
-           sizeof(serv_adr)) < 0) {
+           sizeof(struct sockaddr_un)) < 0) {
     FATAL("bind error");
     return -1;
   }
@@ -5959,6 +6291,7 @@ int startSocketSrv(char** argv) {
         ck_free(blocked_offset);
         blocked_offset = NULL;
       }
+      unlink(SERVER_PATH);
       FATAL("client ask me to suicide");
     }
     if (status == 0) {
@@ -5990,11 +6323,24 @@ int startSocketSrv(char** argv) {
     // }
 
     u32 reward = compute_reward(input, (s32)inputlen, blocked_offset, offset_size, argv);
-    char clnt_buf[128];
+    unsigned char clnt_buf[128];
     int len = makeReplyMsg((double)reward, clnt_buf);
+    
+    // // for debug
+    FILE *fp = fopen("afl.log", "a+");
+    if (fp != NULL){
+      // printBuffer(input, inputlen);
+        for(int i=0; i<len; i++){
+          fprintf(fp, "0x%02x ", *(u8 *)(clnt_buf+i));
+        }
+        fprintf(fp, "\n");
+        fclose(fp);
+    }
+    
     if(write(new_sock, clnt_buf, len) < 0) {
       close(new_sock);
       close(orig_sock);
+      unlink(SERVER_PATH);
       if(input != NULL){
         ck_free(input);
         input = NULL;
