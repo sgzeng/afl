@@ -6296,7 +6296,13 @@ int startSocketSrv(char** argv) {
     }
     if (status == 0) {
       close(new_sock);
-      printf("Client abort, waiting for another request\n");
+      // for debug
+      // FILE *fp = fopen("afl.log", "a+");
+      // if (fp != NULL){
+      //   // printBuffer(input, inputlen);
+      //     fprintf(fp, "Client abort, waiting for another request\n");
+      //     fclose(fp);
+      // }
       if(input != NULL){
         ck_free(input);
         input = NULL;
@@ -6326,16 +6332,16 @@ int startSocketSrv(char** argv) {
     unsigned char clnt_buf[128];
     int len = makeReplyMsg((double)reward, clnt_buf);
     
-    // // for debug
-    FILE *fp = fopen("afl.log", "a+");
-    if (fp != NULL){
-      // printBuffer(input, inputlen);
-        for(int i=0; i<len; i++){
-          fprintf(fp, "0x%02x ", *(u8 *)(clnt_buf+i));
-        }
-        fprintf(fp, "\n");
-        fclose(fp);
-    }
+    // for debug
+    // FILE *fp = fopen("afl.log", "a+");
+    // if (fp != NULL){
+    //   // printBuffer(input, inputlen);
+    //     for(int i=0; i<len; i++){
+    //       fprintf(fp, "0x%02x ", *(u8 *)(clnt_buf+i));
+    //     }
+    //     fprintf(fp, "\n");
+    //     fclose(fp);
+    // }
     
     if(write(new_sock, clnt_buf, len) < 0) {
       close(new_sock);
@@ -6349,6 +6355,12 @@ int startSocketSrv(char** argv) {
         ck_free(blocked_offset);
         blocked_offset = NULL;
       }
+      // for debug
+      // FILE *fp = fopen("afl.log", "a+");
+      // if (fp != NULL){
+      //   fprintf(fp, "%s \n", strerror(errno));
+      //   fclose(fp);
+      // }
       FATAL("write to socket failed");
     }
     // reset virgin map
@@ -6357,7 +6369,6 @@ int startSocketSrv(char** argv) {
     }else{
       read_bitmap(in_bitmap);
     }
-    close(new_sock);
     if(input != NULL){
       ck_free(input);
       input = NULL;

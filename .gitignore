@@ -3,6 +3,7 @@
 # Built objects and libraries
 *.o
 *.so
+/.vscode
 
 # Standard AFL build
 /afl-analyze
